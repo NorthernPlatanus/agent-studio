@@ -1,0 +1,79 @@
+# ============================================================================
+# Generic skeleton defaults — PROJECT-AGNOSTIC.
+# A concrete project overrides these in config/projects/<name>.yaml
+# (selected via --project or ORCH_PROJECT). Personal overrides go in
+# config/local.yaml (gitignored). Env vars win over everything: ORCH_<SECTION>_<KEY>.
+# ============================================================================
+
+project:
+  repo_path: null            # REQUIRED per project
+  base_branch: main
+  feature_branch: agents/feature   # orchestrator-owned; merges into it are automatic
+  backlog_file: BACKLOG.md         # human-readable source of truth
+  todo_file: null                  # optional at-a-glance board
+  protocol_file: null              # optional repo protocol doc (context for planner)
+  # Paths (prefixes) that exist only in the primary checkout (gitignored in
+  # the repo) and must be read from repo_path even when working in a worktree.
+  untracked_doc_prefixes: []
+
+paths:
+  state_dir: ./state               # SQLite store + LangGraph checkpoints + logs
+  work_dir: ./state/worktrees      # per-candidate git worktrees (outside the repo)
+
+# Backlog adapter: how tasks are recognized in backlog_file and how status is
+# written back. The default adapter is a markdown checklist; the regex must
+# expose named groups (status, id, title).
+backlog:
+  adapter: markdown_checklist
+  item_pattern: '^\s*-\s*\[(?P<status>[ x~!])\]\s*\*\*(?P<id>[A-Z]+-\d+)\*\*\s*(?P<title>.+)$'
+  status_chars: {todo: " ", in_progress: "~", done: "x", blocked: "!"}
+
+providers:
+  claude_cli:
+    type: claude_cli
+    binary: claude
+    allowed_tools: "Read,Grep,Glob"   # read-only: planner/reviewer inspect, never edit
+    timeout_s: 600
+
+worker_models: {}     # per project: name -> {provider, model, input_per_mtok, output_per_mtok}
+
+roles:
+  planner:  {provider: claude_cli, model: opus}
+  reviewer: {provider: claude_cli, model: opus}
+  worker:
+    default: null                  # REQUIRED per project (key into worker_models)
+    candidates: []                 # pool for best-of-N
+
+run:
+  n_candidates: 1        # best-of-N; the planner may raise it per task
+  max_retries: 3         # gate/review failure -> worker retry, at most this many
+  max_parallel_tasks: 2  # scheduler batch width (files_write-disjoint tasks only)
+  need_files_rounds: 2   # extra-file requests a worker may make; orchestrator arbitrates
+  need_files_max_bytes: 65536
+  on_limit_exhausted: pause   # pause (checkpoint & stop) | degrade (opus roles -> degrade_model)
+  degrade_model: null
+
+# The deterministic self-check gate: shell commands run in the candidate
+# worktree, zero tokens. Entirely project-defined.
+gate:
+  install_cmd: null      # run once per fresh worktree, e.g. "npm ci"
+  install_marker: null   # skip install_cmd if this path exists, e.g. "node_modules"
+  commands: []           # REQUIRED per project
+  timeout_s: 1200
+  log_tail_chars: 6000   # failure log tail shown to the worker on retry
+
+budget:
+  per_task_usd: 1.50
+  per_run_usd: 15.00
+  count_claude_cli: false   # subscription-covered: logged, not counted as cash
+
+worker_output:
+  full_file_max_lines: 400  # larger files must be edited via SEARCH/REPLACE
+
+prompts:
+  dir: config/prompts       # planner.md, worker_system.md, worker_protocol.md, reviewer.md, reviewer_select.md
+
+# Extra MCP servers for claude_cli roles (reviewer/planner), e.g. a live
+# devtools/inspector bridge for whatever app you're orchestrating.
+# {name: {enabled, mcp_config}}
+mcp: {}

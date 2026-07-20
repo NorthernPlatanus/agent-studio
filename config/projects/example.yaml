@@ -1,0 +1,57 @@
+# ============================================================================
+# TEMPLATE project profile — copy this file to config/projects/<yourname>.yaml
+# and fill in the fields below for the repo you want the orchestrator to work
+# on. Everything here is a placeholder; nothing in this file should be treated
+# as a real value. Machine-specific values (absolute paths) belong in
+# config/local.yaml (gitignored, see config/local.yaml.example) instead of
+# being hardcoded here, so this file stays safe to commit and share.
+# ============================================================================
+
+project:
+  # REQUIRED. Prefer leaving this null here and setting the real absolute path
+  # in config/local.yaml — keeps personal paths out of git entirely.
+  repo_path: null
+  base_branch: main
+  feature_branch: agents/feature
+  backlog_file: BACKLOG.md          # human-readable source of truth
+  todo_file: null                   # optional at-a-glance board
+  protocol_file: null               # optional repo protocol doc (context for planner)
+  untracked_doc_prefixes: []        # gitignored-in-target-repo paths the planner may still need to read
+
+paths:
+  state_dir: ./state
+  work_dir: null                    # REQUIRED; also fine to set via config/local.yaml
+
+providers:
+  # Example OpenAI-compatible aggregator entry — replace with your own.
+  example_provider:
+    type: openai_compatible
+    base_url: https://api.example.com/v1
+    api_key_env: EXAMPLE_PROVIDER_KEY
+    timeout_s: 300
+
+# VERIFY exact model ids and prices against your provider's current list.
+worker_models:
+  example_model: {provider: example_provider, model: some-model-id, input_per_mtok: 0.50, output_per_mtok: 1.50}
+
+roles:
+  planner:  {provider: claude_cli, model: opus}
+  reviewer: {provider: claude_cli, model: opus}
+  worker:
+    default: example_model          # REQUIRED: key into worker_models
+    candidates: [example_model]     # pool for best-of-N
+
+run:
+  on_limit_exhausted: pause
+  degrade_model: example_model
+
+gate:
+  install_cmd: null       # e.g. "npm ci", "pip install -e .[dev]", "cargo fetch"
+  install_marker: null    # skip install_cmd if this path exists, e.g. "node_modules"
+  commands: []            # REQUIRED, e.g. ["npm run typecheck", "npm run lint", "npm test"]
+  timeout_s: 1200
+
+# Optional extra MCP servers for the planner/reviewer roles (claude_cli), e.g.
+# a live app inspector or devtools bridge specific to your project. Off by
+# default. {name: {enabled, mcp_config}}
+mcp: {}
