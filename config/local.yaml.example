@@ -1,0 +1,15 @@
+# Personal / machine-specific overrides — gitignored, never committed.
+#
+# Layering order is: default.yaml < config/projects/<name>.yaml < local.yaml
+# < environment variables (ORCH_<SECTION>_<KEY>). Use this file for anything
+# tied to your own machine — mainly absolute paths — so config/projects/*.yaml
+# stays generic and safe to share/commit.
+#
+# To use: copy this file to config/local.yaml and fill in real values.
+# config/local.yaml is already in .gitignore.
+
+project:
+  repo_path: /absolute/path/to/the/repo/you/are/orchestrating
+
+paths:
+  work_dir: /absolute/path/to/a/scratch/dir/for/worktrees

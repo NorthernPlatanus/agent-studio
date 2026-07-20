@@ -1,0 +1,7 @@
+{
+  "dependencies": ["."],
+  "graphs": {
+    "task": "orchestrator.studio:graph"
+  },
+  "env": ".env"
+}

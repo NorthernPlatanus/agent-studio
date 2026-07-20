@@ -1,3 +1,21 @@
+__pycache__/
+*.pyc
+.venv/
+venv/
+.env
+config/local.yaml
+state/
+*.sqlite3
+*.db
+logs/
+.pytest_cache/
+*.egg-info/
+.DS_Store
+.langgraph_api/
+docs/
+*_pat.txt
+*.pat
+.secrets/
 
 # Operator config and policy, not repo content.
 .claude/

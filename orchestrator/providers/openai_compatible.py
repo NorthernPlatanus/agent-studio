@@ -1,0 +1,65 @@
+"""OpenAI-compatible endpoint provider (CometAPI, OpenRouter, vLLM, ...).
+
+Cost is derived from the project's worker_models price table (the aggregator
+response usually doesn't carry pricing).
+"""
+
+from __future__ import annotations
+
+import logging
+import os
+
+from openai import AsyncOpenAI
+
+from ..core.errors import OrchestratorError
+from .base import LLMProvider, LLMResult
+
+log = logging.getLogger("orchestrator.openai_compatible")
+
+
+class OpenAICompatibleProvider(LLMProvider):
+    type = "openai_compatible"
+
+    def __init__(self, name, pcfg, cfg):
+        super().__init__(name, pcfg, cfg)
+        key_env = pcfg.get("api_key_env", "")
+        api_key = os.environ.get(key_env, "") if key_env else ""
+        if not api_key:
+            log.warning("provider %s: env %s is empty (calls will fail)", name, key_env)
+        self.client = AsyncOpenAI(
+            base_url=pcfg.base_url,
+            api_key=api_key or "missing-key",
+            timeout=float(pcfg.get("timeout_s", 300)),
+            max_retries=2,
+        )
+        # model id -> (in $/Mtok, out $/Mtok)
+        self.prices: dict[str, tuple[float, float]] = {}
+        for wm in (cfg.get("worker_models") or {}).keys():
+            entry = cfg.worker_models.get(wm)
+            if entry.provider == name:
+                self.prices[entry.model] = (
+                    float(entry.get("input_per_mtok", 0)),
+                    float(entry.get("output_per_mtok", 0)),
+                )
+
+    async def complete(self, *, model: str, system: str, user: str,
+                       cwd: str | None = None) -> LLMResult:
+        try:
+            resp = await self.client.chat.completions.create(
+                model=model,
+                messages=[
+                    {"role": "system", "content": system},
+                    {"role": "user", "content": user},
+                ],
+            )
+        except Exception as e:  # surfaced as a candidate failure, not a crash
+            raise OrchestratorError(f"{self.name}/{model} call failed: {e}") from e
+
+        text = (resp.choices[0].message.content or "") if resp.choices else ""
+        usage = resp.usage
+        in_tok = getattr(usage, "prompt_tokens", 0) or 0
+        out_tok = getattr(usage, "completion_tokens", 0) or 0
+        pin, pout = self.prices.get(model, (0.0, 0.0))
+        cost = in_tok / 1e6 * pin + out_tok / 1e6 * pout
+        return LLMResult(text=text, input_tokens=in_tok, output_tokens=out_tok,
+                         cost_usd=cost, model=model, raw=resp)
