@@ -1,12 +1,18 @@
 """Layered configuration.
 
 Merge order (later wins):
-  1. config/default.yaml           — generic skeleton defaults
-  2. config/projects/<name>.yaml   — the project profile (--project / ORCH_PROJECT)
-  3. config/local.yaml             — personal overrides (gitignored)
-  4. ORCH_<SECTION>_<KEY> env vars — e.g. ORCH_PROJECT_REPO_PATH, ORCH_RUN_N_CANDIDATES
+  1. config/default.yaml               — generic skeleton defaults
+  2. projects/<name>/profile.yaml      — the project profile (--project / ORCH_PROJECT),
+     falling back to the legacy config/projects/<name>.yaml when the new path is absent
+  3. config/local.yaml                 — personal overrides (gitignored)
+  4. ORCH_<SECTION>_<KEY> env vars     — e.g. ORCH_PROJECT_REPO_PATH, ORCH_RUN_N_CANDIDATES
 
 Access is attribute-style: cfg.project.repo_path, cfg.gate.commands, ...
+
+Prompts resolve through two layers (Phase 0): a per-project overlay
+(prompts.project_dir, gitignored, {project}-substituted) wins over the shared
+committed templates (prompts.shared_dir). The legacy prompts.dir key is treated
+as shared_dir for back-compat.
 """
 
 from __future__ import annotations
@@ -114,12 +120,36 @@ class Config(Section):
         p.mkdir(parents=True, exist_ok=True)
         return p
 
-    def prompts_dir(self) -> Path:
-        p = Path(self._data["prompts"]["dir"]).expanduser()
+    def _resolve_root(self, raw: str) -> Path:
+        p = Path(raw).expanduser()
         return p if p.is_absolute() else self.root / p
 
+    def shared_prompts_dir(self) -> Path:
+        """Committed template prompts. Honors legacy `prompts.dir`."""
+        prompts = self._data.get("prompts", {}) or {}
+        raw = prompts.get("shared_dir") or prompts.get("dir") or "config/prompts"
+        return self._resolve_root(raw)
+
+    def project_prompts_dir(self) -> Path | None:
+        """Per-project, gitignored prompt overlay (or None if unconfigured)."""
+        prompts = self._data.get("prompts", {}) or {}
+        raw = prompts.get("project_dir")
+        if not raw:
+            return None
+        return self._resolve_root(raw.replace("{project}", self.project_name))
+
+    # Back-compat alias: callers that want "the prompt dir" get the shared one.
+    def prompts_dir(self) -> Path:
+        return self.shared_prompts_dir()
+
     def prompt(self, name: str, **fmt: Any) -> str:
-        text = (self.prompts_dir() / f"{name}.md").read_text()
+        filename = f"{name}.md"
+        project_dir = self.project_prompts_dir()
+        if project_dir is not None and (project_dir / filename).exists():
+            path = project_dir / filename
+        else:
+            path = self.shared_prompts_dir() / filename
+        text = path.read_text()
         if fmt:
             for key, value in fmt.items():
                 text = text.replace("{" + key + "}", str(value))
@@ -139,9 +169,18 @@ def load_config(project: str | None = None, root: Path | None = None) -> Config:
 
     data = _load_yaml(cfg_dir / "default.yaml")
     if project:
-        profile = cfg_dir / "projects" / f"{project}.yaml"
-        if not profile.exists():
-            raise FileNotFoundError(f"No project profile: {profile}")
+        # New layout: gitignored projects/<name>/profile.yaml wins; fall back to
+        # the legacy committed config/projects/<name>.yaml.
+        new_profile = root / "projects" / project / "profile.yaml"
+        legacy_profile = cfg_dir / "projects" / f"{project}.yaml"
+        if new_profile.exists():
+            profile = new_profile
+        elif legacy_profile.exists():
+            profile = legacy_profile
+        else:
+            raise FileNotFoundError(
+                f"No project profile: looked for {new_profile} and {legacy_profile}"
+            )
         data = _deep_merge(data, _load_yaml(profile))
     data = _deep_merge(data, _load_yaml(cfg_dir / "local.yaml"))
     data = _apply_env(data)

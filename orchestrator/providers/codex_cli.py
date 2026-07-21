@@ -1,0 +1,197 @@
+"""Codex CLI provider — `codex exec` subprocess (smart-tier alternative to Claude).
+
+Mirrors claude_cli.py: a non-interactive CLI call that reuses the installed
+Codex CLI's saved auth. Verified against the OpenAI Codex non-interactive docs
+(codex exec): it defaults to a READ-ONLY sandbox, streams progress to stderr,
+and prints the final agent message to stdout; `--json` emits JSONL events and
+`--output-last-message <file>` writes the final message to a file.
+
+Invariants honored:
+  * Read-only by design. `allowed_tools` maps to `--sandbox <mode>`, defaulting
+    to `read-only` so planner/reviewer never edit the repo — same guarantee as
+    claude_cli's `allowed_tools: "Read,Grep,Glob"`.
+  * MCP is best-effort and OFF by default (enable_mcp: false). `codex exec`
+    cannot approve MCP tool calls without a dangerous bypass, so we NEVER trade
+    away the sandbox to enable it (Fable N6): if MCP can't be granted safely we
+    simply degrade (skip MCP for that role).
+
+Codex has no `--append-system-prompt` analogue, so the system text is prepended
+to the user prompt.
+"""
+
+from __future__ import annotations
+
+import asyncio
+import json
+import logging
+import os
+import re
+import tempfile
+from pathlib import Path
+
+from ..core.errors import LimitExhausted, OrchestratorError
+from .base import LLMProvider, LLMResult
+
+log = logging.getLogger("orchestrator.codex_cli")
+
+# Codex limit/quota wording (broad, like claude_cli — extend as observed).
+LIMIT_PATTERNS = re.compile(
+    r"(usage limit|weekly limit|rate limit|limit reached|too many requests"
+    r"|quota|429|out of (usage|credits)|upgrade to continue|limit will reset)",
+    re.I,
+)
+
+_SANDBOX_MODES = {"read-only", "workspace-write", "danger-full-access"}
+
+
+class CodexCliProvider(LLMProvider):
+    type = "codex_cli"
+
+    def _sandbox_mode(self) -> str:
+        """Map allowed_tools -> a codex --sandbox mode. Anything that isn't an
+        explicit codex mode (e.g. a Claude-style 'Read,Grep,Glob') is treated as
+        read-only — never widen the sandbox implicitly."""
+        v = (self.pcfg.get("allowed_tools") or "read-only").strip()
+        return v if v in _SANDBOX_MODES else "read-only"
+
+    def _mcp_config_args(self) -> list[str]:
+        """Best-effort MCP translation to `-c mcp_servers.*` overrides. OFF
+        unless enable_mcp is set, and NEVER adds a bypass/danger flag."""
+        args: list[str] = []
+        if not self.pcfg.get("enable_mcp"):
+            return args
+        for name in (self.cfg.get("mcp") or {}).keys():
+            entry = self.cfg.mcp.get(name)
+            if entry and entry.get("enabled"):
+                cmd = entry.get("command")
+                if cmd:
+                    args += ["-c", f"mcp_servers.{name}.command={cmd}"]
+        return args
+
+    @staticmethod
+    def _parse_events(stdout: str) -> tuple[str, int, int]:
+        """Tolerant JSONL parse: return (final_text, input_tokens, output_tokens).
+        Codex event schema varies across releases, so we scan defensively and
+        keep the last text-bearing event as the final message."""
+        text = ""
+        in_tok = out_tok = 0
+        for line in stdout.splitlines():
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                ev = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            if not isinstance(ev, dict):
+                continue
+            usage = ev.get("usage") or (ev.get("item") or {}).get("usage") or {}
+            if isinstance(usage, dict) and usage:
+                in_tok = int(usage.get("input_tokens",
+                             usage.get("prompt_tokens", in_tok)) or in_tok)
+                out_tok = int(usage.get("output_tokens",
+                              usage.get("completion_tokens", out_tok)) or out_tok)
+            cand = None
+            if isinstance(ev.get("text"), str):
+                cand = ev["text"]
+            elif isinstance(ev.get("message"), str):
+                cand = ev["message"]
+            else:
+                item = ev.get("item") or {}
+                if isinstance(item, dict) and isinstance(item.get("text"), str):
+                    cand = item["text"]
+                msg = ev.get("msg") or {}
+                if isinstance(msg, dict):
+                    if isinstance(msg.get("message"), str):
+                        cand = msg["message"]
+                    elif isinstance(msg.get("text"), str):
+                        cand = msg["text"]
+            if cand is not None:
+                text = cand
+        return text, in_tok, out_tok
+
+    async def complete(self, *, model: str, system: str, user: str,
+                       cwd: str | None = None) -> LLMResult:
+        binary = os.environ.get("CODEX_BIN", self.pcfg.binary)
+        prompt = f"{system}\n\n{user}" if system else user
+
+        last_msg = tempfile.NamedTemporaryFile(
+            mode="r", suffix=".txt", delete=False)
+        last_msg_path = last_msg.name
+        last_msg.close()
+
+        args = [
+            binary, "exec",
+            "--json",
+            "--skip-git-repo-check",
+            "--sandbox", self._sandbox_mode(),
+            "--model", model,
+            "--output-last-message", last_msg_path,
+        ]
+        args += self._mcp_config_args()
+        args += [prompt]
+
+        timeout = int(self.pcfg.get("timeout_s", 600))
+        log.debug("codex_cli: %s exec ... (cwd=%s, sandbox=%s)",
+                  binary, cwd, self._sandbox_mode())
+        proc = await asyncio.create_subprocess_exec(
+            *args, cwd=cwd,
+            stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE)
+        try:
+            stdout_b, stderr_b = await asyncio.wait_for(
+                proc.communicate(), timeout)
+        except asyncio.TimeoutError:
+            proc.kill()
+            await proc.wait()  # reap; avoid a zombie process
+            _safe_unlink(last_msg_path)
+            raise OrchestratorError(f"codex CLI timed out after {timeout}s")
+
+        out, err = stdout_b.decode(), stderr_b.decode()
+        combined = out + "\n" + err
+
+        if proc.returncode != 0:
+            _safe_unlink(last_msg_path)
+            if LIMIT_PATTERNS.search(combined):
+                raise LimitExhausted(f"codex CLI limit: {combined.strip()[:500]}")
+            raise OrchestratorError(
+                f"codex CLI exited {proc.returncode}: {combined.strip()[:1000]}")
+
+        text, in_tok, out_tok = self._parse_events(out)
+        # --output-last-message is the most reliable source of the final text.
+        file_text = _read_and_unlink(last_msg_path)
+        if file_text:
+            text = file_text
+
+        # Subscription auth (default): logged, not counted (cost 0, like
+        # claude_cli). API auth: try the price table; unknown model -> 0.
+        cost = 0.0
+        if self.pcfg.get("auth", "subscription") == "api":
+            cost = self._priced(model, in_tok, out_tok)
+
+        return LLMResult(text=text, input_tokens=in_tok, output_tokens=out_tok,
+                         cost_usd=cost, model=model, raw=out)
+
+    def _priced(self, model: str, in_tok: int, out_tok: int) -> float:
+        for wm in (self.cfg.get("worker_models") or {}).keys():
+            entry = self.cfg.worker_models.get(wm)
+            if entry and entry.get("provider") == self.name and entry.get("model") == model:
+                return (in_tok / 1e6 * float(entry.get("input_per_mtok", 0))
+                        + out_tok / 1e6 * float(entry.get("output_per_mtok", 0)))
+        return 0.0
+
+
+def _safe_unlink(path: str) -> None:
+    try:
+        os.unlink(path)
+    except OSError:
+        pass
+
+
+def _read_and_unlink(path: str) -> str:
+    try:
+        with open(path) as f:
+            text = f.read().strip()
+    except OSError:
+        text = ""
+    _safe_unlink(path)
+    return text

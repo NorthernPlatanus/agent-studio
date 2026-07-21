@@ -18,8 +18,9 @@ from ..core.config import Config
 from ..core.context import RunContext
 from ..core.errors import BudgetExceeded, LimitExhausted
 from ..ops.gitops import Git
-from .graph import build_task_graph
-from .scheduler import next_batch, queue_stats
+from .graph import build_task_graph, resolve_worker_pool
+from .scheduler import (domain_stats, next_batch, queue_stats,
+                        seam_tasks_missing_deps)
 from ..ops.store import Store
 
 log = logging.getLogger("orchestrator.runner")
@@ -39,6 +40,11 @@ def _plan_only(ctx: RunContext, task_filter: set[str] | None) -> None:
     tasks = _filtered(ctx, task_filter)
     print(f"\n=== DRY RUN (project: {ctx.cfg.project_name}) ===")
     print(f"queue: {queue_stats(tasks)}")
+    print(f"domains: {domain_stats(tasks)}")
+    seam_missing = seam_tasks_missing_deps(tasks)
+    if seam_missing:
+        print(f"⚠  seam tasks with NO deps (should serialize after their domain "
+              f"work): {seam_missing}")
     simulated_done: set[str] = set()
     wave = 1
     while True:
@@ -48,9 +54,10 @@ def _plan_only(ctx: RunContext, task_filter: set[str] | None) -> None:
         print(f"\n-- wave {wave} (parallel, files_write-disjoint) --")
         for t in batch:
             n = t.get("n_candidates") or int(ctx.cfg.run.n_candidates)
-            cands = ([ctx.cfg.roles.worker.default] if n <= 1
-                     else list(ctx.cfg.roles.worker.candidates)[:n])
-            print(f"  {t['id']}: {t['title']}")
+            default, pool = resolve_worker_pool(ctx.cfg, t)
+            cands = [default] if n <= 1 else (pool or [default])[:n]
+            dom = f"   domain: {t['domain']}" if t.get("domain") else ""
+            print(f"  {t['id']}: {t['title']}{dom}")
             print(f"    candidates: {cands}   writes: {t.get('files_write')}")
             print(f"    reads: {t.get('files_read')}")
             t["status"] = "done"  # simulate for wave computation

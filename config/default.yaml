@@ -34,22 +34,56 @@ providers:
     binary: claude
     allowed_tools: "Read,Grep,Glob"   # read-only: planner/reviewer inspect, never edit
     timeout_s: 600
+  # Codex smart-tier alternative. Defined here (not commented) so that flipping
+  # roles.smart_provider to codex_cli is a genuine one-line switch. `codex exec`
+  # defaults to a read-only sandbox — planner/reviewer never edit the repo.
+  codex_cli:
+    type: codex_cli
+    binary: codex
+    allowed_tools: "read-only"      # -> --sandbox read-only (read-only|workspace-write|danger-full-access)
+    auth: subscription              # subscription (logged, not counted) | api (counted vs cash budget)
+    enable_mcp: false               # best-effort MCP translation; codex exec cannot approve MCP calls
+                                    # without a dangerous bypass, so OFF by default (never weakens sandbox)
+    timeout_s: 600
 
 worker_models: {}     # per project: name -> {provider, model, input_per_mtok, output_per_mtok}
 
 roles:
-  planner:  {provider: claude_cli, model: opus}
-  reviewer: {provider: claude_cli, model: opus}
+  # smart_provider drives BOTH planner and reviewer (the whole "thinking tier").
+  # Flip claude_cli <-> codex_cli to A/B the smart tier; cheap workers unaffected.
+  smart_provider: claude_cli        # claude_cli | codex_cli
+  # provider: null => inherit smart_provider. An explicit provider still wins
+  # (back-compat with profiles that hard-code provider: claude_cli).
+  planner:  {provider: null, model: opus}
+  reviewer: {provider: null, model: opus}
   worker:
     default: null                  # REQUIRED per project (key into worker_models)
     candidates: []                 # pool for best-of-N
 
 run:
-  n_candidates: 1        # best-of-N; the planner may raise it per task
+  n_candidates: 1        # best-of-N diversity knob (the planner may raise it per task)
   max_retries: 3         # gate/review failure -> worker retry, at most this many
-  max_parallel_tasks: 2  # scheduler batch width (files_write-disjoint tasks only)
-  need_files_rounds: 2   # extra-file requests a worker may make; orchestrator arbitrates
+  max_parallel_tasks: 3  # scheduler batch width (files_write-disjoint tasks only)
+  # Warm review->fix depth on the cheap Rung-1 worker before escalation. Distinct
+  # from max_retries (the diversity/best-of-N ceiling): max_fix_rounds is the
+  # cost-efficient refinement ceiling per candidate on a warm cache.
+  max_fix_rounds: 4
+  # Escalation ladder (Rung 3): when the cheap warm loop exhausts max_fix_rounds
+  # without a green gate, hand the task to a $0-cash SUBSCRIPTION senior (never a
+  # mid-tier/senior API model). Off by default (needs a smart tier configured).
+  escalate_on_exhaustion: false
+  escalate_target: smart_provider   # the claude_cli/codex_cli subscription tier
+  escalate_model: opus              # senior id — MUST co-vary with smart_provider
+                                    # (opus/sonnet under claude_cli; a gpt-5.6-* id under codex_cli)
+  need_files_rounds: 2   # legacy alias for retrieval_rounds (kept for back-compat)
   need_files_max_bytes: 65536
+  # Bounded read-only retrieval loop (Phase 2): a worker may emit <grep>/<read>/
+  # <ls> instead of a patch; the orchestrator runs them read-only in the worktree
+  # and appends results to the next prompt. Keeps the planner's files_read as the
+  # primary context path — retrieval supplements, never replaces it.
+  retrieval_rounds: 3         # max read-only request rounds before a forced implement attempt
+  retrieval_max_matches: 40   # cap on grep matches returned per request
+  retrieval_snippet_lines: 4  # snippet size per grep match
   on_limit_exhausted: pause   # pause (checkpoint & stop) | degrade (opus roles -> degrade_model)
   degrade_model: null
 
@@ -65,13 +99,61 @@ gate:
 budget:
   per_task_usd: 1.50
   per_run_usd: 15.00
-  count_claude_cli: false   # subscription-covered: logged, not counted as cash
+  # Subscription-auth CLI tiers (claude_cli, codex_cli auth:subscription) are
+  # logged for visibility but not counted against the cash budget. Set count_cli
+  # true to count ALL CLI providers, or per-provider `count: true` in providers.*.
+  count_claude_cli: false   # back-compat alias; counts claude_cli when true
+  count_cli: false          # generalized: counts every subscription CLI provider when true
 
 worker_output:
   full_file_max_lines: 400  # larger files must be edited via SEARCH/REPLACE
+  # Worker loop style. `blocks` (default): plain-text <grep>/<read>/<file>/<edit>
+  # protocol over complete_chat — works on any chat-completions model and keeps
+  # the provider/budget layer intact. `react`: native tool-calling sub-agent
+  # (optional experiment; requires a usage->budget bridge before use).
+  mode: blocks              # blocks | react
 
 prompts:
-  dir: config/prompts       # planner.md, worker_system.md, worker_protocol.md, reviewer.md, reviewer_select.md
+  # Two-layer resolver: a per-project overlay wins over the shared templates.
+  shared_dir: config/prompts               # committed templates (planner.md, worker_system.md, ...)
+  project_dir: projects/{project}/prompts  # gitignored per-project overrides ({project} substituted at load)
+  # Legacy `dir:` is still honored as an alias for shared_dir (back-compat).
+
+# Structural project-map for the planner (Phase 4). Regenerated by the
+# integrator after each successful merge, into the gitignored projects/<name>/
+# overlay. The structural layer is free/deterministic; the prose digest is
+# optional and off by default.
+projectmap:
+  enabled: true
+  path: projectmap.md      # under projects/<name>/
+  symbols: default         # 'default' regex set (or provide your own later)
+  digest: false            # optional cheap prose summary; regenerated only on structural change
+
+# Domains ("departments"): a specialization + observability layer over the
+# scheduler's files_write-disjoint safety invariant (which is unchanged). A spec's
+# `domain` (planner-assigned) can override the worker pool and inject a
+# domain-specific protocol excerpt. Use cheap-tier worker_models keys here — NOT
+# the mid-tier API models the escalation ladder deliberately skips. Illustrative;
+# real domains live in the project profile.
+domains: {}
+  # physics: { worker_default: ds_v4_flash, protocol: physics }   # protocol -> prompts/physics.md
+  # render:  { worker_default: ds_v4_flash, protocol: render }
+  # seam:    {}   # cross-cutting/shared-file work; planner gives it explicit deps so it serializes
+
+# Optional visual/runtime gate (Phase 6). Green gate => "it runs", not "it's
+# correct": a three.js scene can compile clean and render nothing. This asserts
+# over the scene-graph via a pluggable MCP inspector. OFF by default — the
+# harness runs fine with enabled:false; only `visual: true` specs are checked.
+visual_gate:
+  enabled: false
+  inspector: threejs           # key into `mcp:`; later: unity | blender
+  run_cmd: null                # e.g. "npm run dev" — foreground; supervised + process-group-killed
+  ready_probe: null            # e.g. "http://localhost:5173"
+  assertions: []               # restricted expressions over scene facts, e.g.
+                               #   - "scene.visibleMeshCount > 0"
+                               #   - "any(l.intensity > 0 for l in lights)"
+                               #   - "camera.seesSceneBounds"
+  screenshot_fallback: false   # last resort (pixel-diff vs reference); expensive/flaky, off
 
 # Extra MCP servers for claude_cli roles (reviewer/planner), e.g. a live
 # devtools/inspector bridge for whatever app you're orchestrating.

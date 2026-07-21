@@ -3,9 +3,11 @@
 A **project-agnostic multi-agent development orchestrator** on LangGraph 1.x.
 The core knows nothing about any particular language, framework, or repo —
 every project-specific detail (paths, gate commands, worker models, coding
-protocol) lives in `config/projects/<name>.yaml` and `config/prompts/`. See
-`config/projects/example.yaml` for the template to copy when wiring up a
-project.
+protocol) lives in a per-project profile and prompt overlay. The committed
+template is `config/projects/example.yaml`; the real, machine-specific profile
+lives in the **gitignored** `projects/<name>/profile.yaml` (with optional
+prompt overrides in `projects/<name>/prompts/`). The loader reads the new path
+first and falls back to the legacy `config/projects/<name>.yaml`.
 
 ## The economic model
 
@@ -13,10 +15,15 @@ Two tiers of intelligence, priced accordingly:
 
 | Role | Model | Channel | Cost |
 |---|---|---|---|
-| Planner | Opus | Claude Code CLI (`claude -p`) | subscription (uses your weekly limit) |
-| Reviewer | Opus | Claude Code CLI | subscription |
-| Workers | DeepSeek / GLM / Kimi | CometAPI (OpenAI-compatible) | cents |
-| Scheduler, Gate, Integrator | — | pure Python + git | **zero** |
+| Planner (tech-lead) | Opus **or** GPT-5.6 | Claude Code CLI / Codex CLI | subscription (weekly limit) |
+| Reviewer (rubric) | Opus **or** GPT-5.6 | Claude Code CLI / Codex CLI | subscription |
+| Workers | DeepSeek V4 Flash / GLM / Kimi | CometAPI (OpenAI-compatible) | cents |
+| Escalation senior | subscription Opus/Sonnet or GPT-5.6 | CLI (patch→gate, not repo edits) | subscription |
+| Scheduler, Gate, Integrator, Retrieval, Visual gate | — | pure Python + git | **zero** |
+
+The whole **smart tier** (planner + reviewer) is one config switch,
+`roles.smart_provider: claude_cli | codex_cli` — flip it to A/B Claude vs Codex;
+the cheap CometAPI workers are untouched either way.
 
 The design maximizes quality-per-token:
 
@@ -35,24 +42,27 @@ The design maximizes quality-per-token:
 ## Architecture
 
 ```
- orchestrator plan  ──►  PLANNER (Opus/CLI): backlog ─► enriched specs ─► SQLite store
-                                                          │
+ orchestrator discuss ─► PLANNER tech-lead (multi-turn: asks, pushes back) ─┐
+ orchestrator plan  ──►  PLANNER (Opus/GPT-CLI): backlog ─► enriched specs ─┴─► SQLite store
+                                                          │  (+ project map inserted for context)
  orchestrator run   ──►  SCHEDULER (pure py): deps toposort + files_write-disjoint batches
                                                           │  per task, parallel
                                               ┌───────────▼───────────┐
                                               │  LangGraph task graph  │  thread_id = run:task
                                               │                        │  SqliteSaver checkpoints
         dispatch ──Send fan-out──► work_candidate(×N) ──► collect      │
-           ▲    (candidates: deepseek/glm/kimi, each in its own        │
-           │     git worktree; LLM ─► patch ─► GATE, zero tokens)      │
+           ▲   (candidates: ds_v4_flash/glm/kimi in their own worktree;│
+           │    warm chat + read-only retrieval; LLM ─► patch ─► GATE) │
            ├── retries (≤ max_retries), feedback = raw gate log        │
-           │                                        │ any green        │
-           ├── review says "revise" ◄── REVIEWER (Opus/CLI, diff only) │
+           │                          green │ + visual? ─► VISUAL GATE  │
+           │                                │ (scene assertions)        │
+           ├── escalate (exhausted) ─► SENIOR (subscription, patch→gate)│
+           ├── review says "revise" ◄── REVIEWER (rubric, diff only)   │
            │                                        │ approve          │
            │                              INTEGRATOR (pure py + git):  │
-           │                              merge winner ─► feature      │
-           │                              branch, backlog writeback,   │
-           └──────────────────────────────worktree cleanup ─► finalize │
+           │                              merge winner ─► feature branch│
+           │                              backlog writeback + PROJECT   │
+           └──────────────────────────────MAP regen ─► finalize        │
                                               └────────────────────────┘
 ```
 
@@ -72,10 +82,18 @@ cp .env.example .env      # add your COMETAPI_KEY
 claude --version
 ```
 
-Copy `config/projects/example.yaml` to `config/projects/<yourname>.yaml`, fill
-in the real values (or leave paths null and set them in `config/local.yaml`,
-see `config/local.yaml.example`), and verify worker model ids/prices against
-your provider's current list — aggregator ids rotate.
+Copy `config/projects/example.yaml` to `projects/<yourname>/profile.yaml`
+(the whole `projects/` tree is gitignored — real profiles, prompt overrides,
+and the generated project-map live there and never touch the harness repo).
+Fill in the real values (or leave paths null and set them in
+`config/local.yaml`, see `config/local.yaml.example`), and verify worker model
+ids/prices against your provider's current list — aggregator ids rotate. Per-
+project prompt overrides go in `projects/<name>/prompts/*.md` and win over the
+shared `config/prompts/` templates.
+
+To A/B the smart tier with Codex, install the Codex CLI (logged in) and set
+`roles.smart_provider: codex_cli`; set `run.escalate_model` to a GPT-5.6 id so
+escalation co-varies with the provider.
 
 ## Usage
 
@@ -83,11 +101,13 @@ your provider's current list — aggregator ids rotate.
 # 1. Register backlog items as stubs (no LLM):
 python -m orchestrator import-backlog --project example
 
-# 2. Enrich into executable specs (Opus reads the repo; this is where
-#    files_read/files_write/deps/agent_able get authored):
+# 2. Enrich into executable specs (the tech-lead planner reads the repo; this is
+#    where files_read/files_write/deps/agent_able/complexity/risk get authored):
 python -m orchestrator plan --project example
-#    ...or discuss & re-plan around a new idea:
-python -m orchestrator plan --project example "add rate limiting to the API layer; fold into M4"
+#    ...or hold a multi-turn requirements conversation (it asks, pushes back,
+#    then persists the plan on your approval):
+python -m orchestrator discuss --project example "add rate limiting to the API layer"
+#    (one-shot plan exits asking you to `discuss` if the request is ambiguous)
 
 # 3. See what would happen (waves, candidates, file lists — zero tokens):
 python -m orchestrator run --project example --dry-run
@@ -102,7 +122,7 @@ python -m orchestrator resume --project example    # after a limit/budget pause
 ```
 
 (`example` above is a placeholder project name — swap in whatever you named
-your `config/projects/<name>.yaml`.)
+your `projects/<name>/profile.yaml`.)
 
 ## Graph UI (LangGraph Studio)
 
@@ -134,13 +154,49 @@ Opus call buys N independent implementations.
 notes. Review "reject" means the *spec* is broken — the task goes back to
 humans/planner, not to a worker loop.
 
-**`need_files`**: workers can't read the repo, but they can *ask*
-(`need_files_rounds` cap, size-capped). The orchestrator arbitrates and logs
-every request — a signal that the planner under-specified the task.
+**Read-only retrieval**: workers can't edit or run anything, but they can
+*find their own context*. Instead of a patch they may emit `<grep>`, `<read>`,
+or `<ls>` (plain text — no tool-calling API needed); the orchestrator runs them
+read-only in the worktree and pastes results back, bounded by
+`run.retrieval_rounds`. `<need_files>` is kept as an alias. This cuts the
+planner's burden to author a perfect `files_read`; a high retrieval count still
+logs a `retrieval` / `retrieval_exhausted` signal that the spec was thin.
+
+**Cache-aware warm loop**: each worker (and its retries) is a single warm chat
+whose big prefix — system + protocol + sorted `files_read` — is byte-stable, so
+CometAPI prefix caching bills retries at the cached input rate (~5–6× cheaper).
+Feedback and retrieval results append as later turns; the prefix is never
+mutated. `usage` records `cache_hit_tokens`/`cache_miss_tokens`, visible in
+`status`.
+
+**Escalation ladder**: the cheap worker iterates on a warm cache up to
+`run.max_fix_rounds`; if it still can't pass the gate and
+`run.escalate_on_exhaustion` is on, the task escalates once to a **subscription
+senior** (Opus/Sonnet or GPT-5.6) — cash cost $0. The senior implements through
+the same patch→gate channel (it never edits the repo directly), routed as a
+`dispatch` branch so `Send` still originates only from the fan-out.
+
+**Domains**: the planner tags each spec with a `domain` ("physics", "render",
+"seam", ...). A domain can override the worker pool and inject a domain-specific
+protocol excerpt (`domains:` in the profile). This is a specialization layer;
+the scheduler still enforces files_write-disjointness regardless of domain.
+
+**Visual gate** (optional, `visual_gate.enabled`): for `visual: true` specs, a
+green gate isn't enough ("compiles" ≠ "renders"). The gate starts the app in the
+worktree, drives a pluggable MCP inspector for scene-graph facts, and evaluates
+restricted assertions (e.g. `scene.visibleMeshCount > 0`) — no `eval`. A failure
+marks the candidate `visual_failed` and loops it back through the normal retry.
+
+**Project map**: after each successful merge the integrator regenerates a cheap,
+deterministic structural index (tree + module→symbols) into the gitignored
+`projects/<name>/projectmap.md`, which the planner inserts between the backlog
+and current specs so `files_read` authoring starts from a real skeleton.
 
 **Limits & budgets**: every LLM call lands in the SQLite usage ledger.
 CometAPI spend is checked against `budget.per_task_usd` / `per_run_usd`.
-Claude CLI usage is subscription-covered (logged, not counted, by default).
+Subscription CLI usage (claude_cli, and codex_cli with `auth: subscription`)
+is logged, not counted, by default (`budget.count_cli` / per-provider `count`
+to change that; the legacy `count_claude_cli` still works).
 When the CLI reports limit exhaustion the run **checkpoints and pauses**
 (`run.on_limit_exhausted: pause`); `resume` continues mid-task from the
 LangGraph SQLite checkpoint. Set `degrade` to reroute Opus roles to a cheap
@@ -163,49 +219,57 @@ default and entirely optional.
 
 The core is a skeleton; a new project touches zero Python:
 
-1. Copy `config/projects/example.yaml` → `config/projects/<name>.yaml` — repo
-   path, branches, backlog file + item regex, gate commands
+1. Copy `config/projects/example.yaml` → `projects/<name>/profile.yaml`
+   (gitignored) — repo path, branches, backlog file + item regex, gate commands
    (`cargo check && cargo test`, `pytest`, whatever), providers, worker
-   models + prices, budgets. Keep machine-specific paths out of it by
-   setting them in `config/local.yaml` instead (copy from
-   `config/local.yaml.example`, already gitignored).
-2. `config/prompts/worker_protocol.md` — your project's distilled coding
-   protocol (or point `prompts.dir` at a per-project prompts folder).
-3. Optional: extra MCP servers for reviewer/planner in `mcp:`.
+   models + prices, budgets, and optionally `domains:` / `visual_gate:`. Keep
+   machine-specific paths out of it by setting them in `config/local.yaml`
+   instead (copy from `config/local.yaml.example`, already gitignored).
+2. Per-project prompt overrides in `projects/<name>/prompts/*.md` (e.g.
+   `worker_protocol.md`, a domain excerpt) — they win over `config/prompts/`.
+3. Optional: extra MCP servers for reviewer/planner in `mcp:`; a visual
+   inspector under `visual_gate:`.
 
 Extension points that *are* code, kept deliberately small:
-- new provider type → one class in `orchestrator/providers/` + one registry line;
+- new provider type → one class in `orchestrator/providers/` + one registry line
+  (that's exactly how `codex_cli` was added);
 - new backlog format → one adapter class in `orchestrator/ops/backlog.py`;
-- extra graph stages (e.g. a pixel-diff visual gate) → one node + one edge in `orchestrator/engine/graph.py`.
+- extra graph stages → one node + one edge in `orchestrator/engine/graph.py`.
 
 ## Layout
 
 ```
 config/
   default.yaml            generic skeleton defaults (project-agnostic)
-  projects/example.yaml   TEMPLATE profile — copy & rename per project
+  projects/example.yaml   committed TEMPLATE profile — copy to projects/<name>/profile.yaml
+  projects/example.doc.md committed TEMPLATE per-project doc (copied at project init)
   local.yaml.example      TEMPLATE for gitignored personal/machine overrides
-  prompts/*.md            planner / worker / reviewer prompts (also templates)
+  prompts/*.md            shared planner / worker / reviewer prompts (templates)
+projects/                 (gitignored) per-project overlay: profile.yaml,
+                          prompts/*.md overrides, projectmap.md
 orchestrator/
-  cli.py __main__.py      entrypoint
+  cli.py __main__.py      entrypoint (plan, discuss, run, resume, status, import-backlog)
   studio.py               LangGraph Studio entrypoint (graph UI, langgraph.json)
   core/                   foundation
-    config.py             layered config (default < project < local < env)
+    config.py             layered config + two-layer prompt resolver
     state.py              checkpoint-serializable state + reducers
     context.py errors.py  runtime-services closure + control-flow exceptions
   engine/                 the state machine
     graph.py              LangGraph task graph (Send fan-out via conditional
-                          edges — the 1.x-safe pattern)
+                          edges; dispatch escalation branch, visual_gate)
     runner.py             outer loop: batches, pause/resume, dry-run
-    scheduler.py          zero-token wave planning (deps + files_write)
+    scheduler.py          zero-token wave planning (deps + files_write + domains)
   ops/                    deterministic ops — zero tokens
     store.py backlog.py   SQLite machine truth <-> markdown human truth
     patch.py gitops.py    SEARCH/REPLACE application, worktree isolation
+    retrieval.py          read-only grep/read/ls executors for workers
+    projectmap.py         structural project index (tree + symbols)
+    visualgate.py         scene-graph assertions + safe evaluator
     gate.py budget.py     project self-checks, usage ledger + caps
-  providers/              claude_cli (subscription) / openai_compatible
-  nodes/                  planner, worker, reviewer, integrator (LLM roles)
-tests/                    pure-logic unit tests (patch, scheduler, backlog, graph)
-state/                    (gitignored) SQLite store + checkpoints
+  providers/              claude_cli / codex_cli (subscription) / openai_compatible
+  nodes/                  planner, discuss, worker, reviewer, integrator
+tests/                    pure-logic unit tests
+projects/ state/          (gitignored) per-project overlays; SQLite store + checkpoints
 ```
 
 ## Design notes / known tradeoffs

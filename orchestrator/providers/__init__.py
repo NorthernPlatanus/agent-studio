@@ -4,10 +4,12 @@ from __future__ import annotations
 
 from .base import LLMProvider, LLMResult
 from .claude_cli import ClaudeCliProvider
+from .codex_cli import CodexCliProvider
 from .openai_compatible import OpenAICompatibleProvider
 
 PROVIDER_TYPES: dict[str, type[LLMProvider]] = {
     "claude_cli": ClaudeCliProvider,
+    "codex_cli": CodexCliProvider,
     "openai_compatible": OpenAICompatibleProvider,
 }
 

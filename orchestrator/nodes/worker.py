@@ -19,6 +19,7 @@ from pathlib import Path
 from ..core.context import RunContext
 from ..core.errors import BudgetExceeded, LimitExhausted, OrchestratorError, PatchError
 from ..ops.gate import ensure_deps, run_gate
+from ..ops import retrieval
 from ..ops.patch import apply_response, parse_worker_response
 from ..providers import get_provider
 from ..core.state import Candidate
@@ -29,16 +30,12 @@ log = logging.getLogger("orchestrator.worker")
 def _read_task_file(ctx: RunContext, worktree: Path, rel: str) -> str | None:
     """Code comes from the candidate worktree (branch state); paths under
     project.untracked_doc_prefixes come from the primary checkout, because
-    the target repo may gitignore its own docs."""
-    p = Path(rel)
-    if p.is_absolute() or ".." in p.parts:
-        # Workers can request extra files (need_files) — never let a request
-        # escape the repo/worktree. Treat as missing -> refused.
-        return None
-    prefixes = ctx.cfg.project.untracked_doc_prefixes or []
-    root = ctx.cfg.repo_path() if any(rel.startswith(p) for p in prefixes) else worktree
-    path = root / rel
-    if not path.exists():
+    the target repo may gitignore its own docs. Delegates the safety rule to
+    ops/retrieval so reads and retrieval share one allowlist."""
+    path = retrieval.resolve_read_path(
+        ctx.cfg.repo_path(), worktree,
+        ctx.cfg.project.untracked_doc_prefixes, rel)
+    if path is None or not path.exists():
         return None
     try:
         return path.read_text()
@@ -46,8 +43,43 @@ def _read_task_file(ctx: RunContext, worktree: Path, rel: str) -> str | None:
         return None
 
 
-def _build_user_prompt(ctx: RunContext, spec: dict, files: dict[str, str],
-                       feedback: str) -> str:
+def run_retrieval_requests(ctx: RunContext, worktree: Path, parsed, *,
+                           round_no: int, max_matches: int, snippet_lines: int,
+                           max_bytes: int) -> str:
+    """Execute a round of read-only <grep>/<read>/<ls> requests and format the
+    results as a volatile-suffix block. Never writes; never runs worker shell."""
+    repo = ctx.cfg.repo_path()
+    prefixes = ctx.cfg.project.untracked_doc_prefixes
+    out: list[str] = [f"## RETRIEVAL RESULTS (round {round_no})"]
+    for pat in parsed.grep:
+        matches, status = retrieval.grep(
+            worktree, pat, max_matches=max_matches, snippet_lines=snippet_lines)
+        out.append(f"### grep: {pat} [{status}]")
+        out += matches or ["(no matches)"]
+    for rel in parsed.need_files:
+        path = retrieval.resolve_read_path(repo, worktree, prefixes, rel)
+        text, status = retrieval.read_file(path, max_bytes)
+        if status == "ok":
+            out += [f'<source path="{rel}">', text, "</source>"]
+        else:
+            out.append(f"### read: {rel} [{status}]")
+    for rel in parsed.ls:
+        path = retrieval.resolve_read_path(repo, worktree, prefixes, rel)
+        names = retrieval.ls_dir(path)
+        out.append(f"### ls: {rel}")
+        out += names if names is not None else ["(not a directory)"]
+    return "\n".join(out)
+
+
+def _build_stable_prompt(ctx: RunContext, spec: dict, files: dict[str, str]) -> str:
+    """The FROZEN first turn: task spec + protocol + files in a fixed order.
+
+    This is the cache prefix. It is built exactly once per candidate (attempt 1)
+    and never mutated — feedback and retrieval results arrive as later message
+    turns (the volatile suffix), so retries bill at the cached input rate. The
+    caller is responsible for passing `files` already sorted-once; do NOT fold
+    later-granted files back into this block (that would insert bytes mid-prefix
+    and break byte-stability)."""
     parts = [f"# TASK {spec['id']}: {spec['title']}", "", spec["description"], ""]
     if spec.get("acceptance"):
         parts.append("## Acceptance criteria")
@@ -57,10 +89,20 @@ def _build_user_prompt(ctx: RunContext, spec: dict, files: dict[str, str],
         parts += ["## Task notes", spec["notes_for_worker"], ""]
     parts += ["## Files you may write",
               *[f"- {p}" for p in spec.get("files_write", [])], ""]
-    if feedback:
-        parts += ["## RETRY FEEDBACK — fix exactly this",
-                  "```", feedback, "```", ""]
     parts += ["# PROTOCOL", ctx.cfg.prompt("worker_protocol"), ""]
+    # Optional per-domain protocol excerpt (resolved via the Phase 0 two-layer
+    # resolver: project overlay wins over shared). Injected in addition to the
+    # generic protocol; missing files degrade gracefully.
+    domain = spec.get("domain")
+    domains = ctx.cfg.get("domains") or {}
+    dcfg = domains.get(domain) if domain else None
+    proto_name = dcfg.get("protocol") if dcfg is not None else None
+    if proto_name:
+        try:
+            parts += [f"# DOMAIN PROTOCOL ({domain})",
+                      ctx.cfg.prompt(proto_name), ""]
+        except (FileNotFoundError, OSError):
+            pass
     parts.append("# FILES (your complete view of the repository)")
     for rel, content in files.items():
         parts.append(f'<source path="{rel}">')
@@ -71,12 +113,18 @@ def _build_user_prompt(ctx: RunContext, spec: dict, files: dict[str, str],
 
 async def run_candidate(ctx: RunContext, payload: dict) -> dict:
     """The Send-mapped node body. Payload: {run_id, task_id, spec, cand_id,
-    attempt, feedback}. Returns {"candidates": [Candidate]} for the reducer."""
+    attempt, feedback, messages}. Returns {"candidates": [Candidate]} for the
+    reducer. `messages` is this candidate's warm chat history from prior attempts
+    (per-candidate, plain dicts); it is continued, never rebuilt, so the stable
+    prefix (first turn) stays byte-identical and hits the prompt cache."""
     spec = payload["spec"]
     task_id = payload["task_id"]
     cand_id = payload["cand_id"]
     attempt = payload["attempt"]
     feedback = payload.get("feedback", "")
+    # Per-candidate warm history (plain role/content dicts). Copy so we never
+    # mutate the prior attempt's list in place (earlier turns stay frozen).
+    messages: list[dict] = [dict(m) for m in (payload.get("messages") or [])]
 
     provider_name, model = ctx.worker_target(cand_id)
     provider = get_provider(ctx.cfg, provider_name)
@@ -84,7 +132,8 @@ async def run_candidate(ctx: RunContext, payload: dict) -> dict:
 
     cand: Candidate = {"cand_id": cand_id, "model": model, "attempt": attempt,
                        "status": "llm_failed", "worktree": "", "branch": "",
-                       "diff": "", "gate_log": "", "error": "", "notes": ""}
+                       "diff": "", "gate_log": "", "error": "", "notes": "",
+                       "messages": messages}
     try:
         # Worktree: fresh on attempt 1, reused (with prior commits) on retries.
         if attempt == 1:
@@ -97,49 +146,83 @@ async def run_candidate(ctx: RunContext, payload: dict) -> dict:
         cand["branch"] = ctx.git.wt_branch(wt_name)
         await asyncio.to_thread(ensure_deps, worktree, ctx.cfg)
 
-        files: dict[str, str | None] = {}
-        for rel in dict.fromkeys(
-                list(spec.get("files_read") or []) + list(spec.get("files_write") or [])):
-            files[rel] = _read_task_file(ctx, worktree, rel)
-
         system = ctx.cfg.prompt(
             "worker_system",
             full_file_max_lines=ctx.cfg.worker_output.full_file_max_lines)
 
-        rounds_left = int(ctx.cfg.run.need_files_rounds)
-        max_extra = int(ctx.cfg.run.need_files_max_bytes)
+        if not messages:
+            # First turn for this candidate: read + sort the initial files ONCE;
+            # that sorted block is the frozen prefix for the whole warm chain.
+            files: dict[str, str | None] = {}
+            for rel in sorted(dict.fromkeys(
+                    list(spec.get("files_read") or []) + list(spec.get("files_write") or []))):
+                files[rel] = _read_task_file(ctx, worktree, rel)
+            messages.append({"role": "user",
+                             "content": _build_stable_prompt(ctx, spec, files)})
+        elif feedback:
+            # Continuation (retry / review-fix): append feedback as a NEW turn,
+            # never inserted before the frozen prefix.
+            messages.append({"role": "user",
+                             "content": f"## RETRY FEEDBACK — fix exactly this\n{feedback}"})
+
+        run = ctx.cfg.run
+        # retrieval_rounds supersedes the legacy need_files_rounds (kept as fallback).
+        rounds_left = int(run.get("retrieval_rounds", run.get("need_files_rounds", 3)))
+        max_matches = int(run.get("retrieval_max_matches", 40))
+        snippet_lines = int(run.get("retrieval_snippet_lines", 4))
+        max_bytes = int(run.get("need_files_max_bytes", 65536))
+        forced_final = False
+        round_no = 0
+        # cwd matters for CLI providers (the escalated senior): root its read
+        # tools at the candidate worktree, not the orchestrator repo.
+        cwd = str(worktree)
         while True:
-            user = _build_user_prompt(ctx, spec, files, feedback)
-            result = await provider.complete(model=model, system=system, user=user)
+            result = await provider.complete_chat(
+                model=model, system=system, messages=messages, cwd=cwd)
+            messages.append({"role": "assistant", "content": result.text})
             ctx.budget.record(
                 task_id=task_id, role=f"worker:{cand_id}", provider=provider_name,
                 provider_type=provider.type, model=model,
                 input_tokens=result.input_tokens, output_tokens=result.output_tokens,
-                cost_usd=result.cost_usd)
+                cost_usd=result.cost_usd, cache_hit_tokens=result.cache_hit_tokens,
+                cache_miss_tokens=result.cache_miss_tokens)
             parsed = parse_worker_response(result.text)
 
-            if parsed.need_files and not parsed.touched_paths:
+            # Retrieval-only output (no patch) => execute read-only and loop.
+            # Results append as a NEW user turn (volatile suffix), never before
+            # the frozen prefix.
+            if parsed.has_retrieval and not parsed.touched_paths:
                 if rounds_left <= 0:
-                    raise PatchError("need_files budget exhausted; task spec is "
-                                     "likely missing context (planner problem)")
+                    # Intentional behavior change from the old raise-based
+                    # need_files: instead of hard-failing, force ONE final
+                    # implement attempt and record a retrieval_exhausted signal
+                    # (a high count still flags an under-specified planner spec).
+                    if not forced_final:
+                        forced_final = True
+                        messages.append({"role": "user", "content":
+                            "## RETRIEVAL EXHAUSTED\nNo retrieval rounds remain. "
+                            "Implement the task now with the files you already have."})
+                        ctx.store.log_event(
+                            ctx.run_id, task_id, "retrieval_exhausted",
+                            f"{cand_id} attempt={attempt} rounds={round_no}")
+                        continue
+                    break  # still no patch after the forced final -> guarded below
                 rounds_left -= 1
-                granted, refused = [], []
-                for rel in parsed.need_files:
-                    content = _read_task_file(ctx, worktree, rel)
-                    if content is not None and len(content) <= max_extra:
-                        files[rel] = content
-                        granted.append(rel)
-                    else:
-                        refused.append(rel)
-                ctx.store.log_event(ctx.run_id, task_id, "need_files",
-                                    f"{cand_id} granted={granted} refused={refused}")
-                if refused:
-                    feedback = (feedback + f"\nRefused files (missing or too large): "
-                                f"{refused}. Proceed without them.").strip()
+                round_no += 1
+                messages.append({"role": "user", "content": run_retrieval_requests(
+                    ctx, worktree, parsed, round_no=round_no,
+                    max_matches=max_matches, snippet_lines=snippet_lines,
+                    max_bytes=max_bytes)})
+                ctx.store.log_event(
+                    ctx.run_id, task_id, "retrieval",
+                    f"{cand_id} round={round_no} grep={len(parsed.grep)} "
+                    f"read={len(parsed.need_files)} ls={len(parsed.ls)}")
                 continue
             break
 
-        if parsed.is_empty:
+        # Require an actual patch. A retrieval-only response (even after the
+        # forced final attempt) has no touched_paths and must never be applied.
+        if not parsed.touched_paths:
             raise PatchError("worker returned no <file>/<edit> blocks")
 
         cand["notes"] = parsed.plan[:2000]

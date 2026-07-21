@@ -60,3 +60,21 @@ def queue_stats(tasks: list[Task]) -> dict[str, int]:
     for t in tasks:
         stats[t["status"]] = stats.get(t["status"], 0) + 1
     return stats
+
+
+def domain_stats(tasks: list[Task]) -> dict[str, int]:
+    """Task counts per domain (observability only — the scheduler invariant is
+    unchanged; domains add specialization, not a new safety rule)."""
+    stats: dict[str, int] = {}
+    for t in tasks:
+        d = t.get("domain") or "-"
+        stats[d] = stats.get(d, 0) + 1
+    return stats
+
+
+def seam_tasks_missing_deps(tasks: list[Task]) -> list[str]:
+    """`seam` tasks touch shared files and must serialize after the domain work
+    they depend on — via planner-authored deps (no scheduler change). A seam task
+    with no deps is almost certainly a planner mistake; surface it in dry-run."""
+    return [t["id"] for t in tasks
+            if t.get("domain") == "seam" and not (t.get("deps") or [])]
