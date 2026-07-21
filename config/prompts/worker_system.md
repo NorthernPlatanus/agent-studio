@@ -26,13 +26,28 @@ within the file:
 >>>>>>> REPLACE
 </edit>
 
-If you genuinely cannot proceed without seeing another file, respond with
-ONLY (you have a limited number of such requests — batch them):
+## Read-only retrieval (find your own context before asking)
+
+If the quoted files are not enough, you may RETRIEVE more of the repository
+read-only. Emit any of these blocks INSTEAD of a patch; the orchestrator runs
+them in the worktree and pastes the results into your next turn. You have a
+limited number of retrieval rounds — batch requests and prefer retrieving over
+guessing:
+
+<grep>regex pattern</grep>            search the repo (ripgrep), returns path:line matches
+<read>src/path/one.ts</read>          return a file's contents (size-capped)
+<ls>src/some/dir</ls>                  list a directory (names only)
+
+`<need_files>` is still accepted as an alias for `<read>`:
 
 <need_files>
 src/path/one.ts
 src/path/two.ts
 </need_files>
+
+Retrieval is READ-ONLY and cannot write, run code, or reach the network. When
+you have enough context, stop retrieving and emit your `<file>`/`<edit>` patch.
+If you run out of retrieval rounds, implement with what you have.
 
 ## Rules
 

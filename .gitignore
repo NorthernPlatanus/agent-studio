@@ -13,6 +13,9 @@ logs/
 .DS_Store
 .langgraph_api/
 docs/
+# Per-project overlays: real profiles, prompt overrides, project-maps. Root-anchored
+# so it never matches config/projects/ (the committed example.yaml stays tracked).
+/projects/
 *_pat.txt
 *.pat
 .secrets/

@@ -19,6 +19,23 @@ log = logging.getLogger("orchestrator.reviewer")
 
 JSON_RE = re.compile(r"\{.*\}", re.S)
 
+# Rubric dimensions and weights (acceptance dominates). Winner = max weighted.
+RUBRIC_DIMS = ("acceptance", "tests", "minimality", "protocol_fit")
+_WEIGHTS = {"acceptance": 2.0, "tests": 1.0, "minimality": 1.0, "protocol_fit": 1.0}
+
+
+def weighted_score(scores: dict) -> float:
+    return sum(_WEIGHTS[d] * float(scores.get(d, 0)) for d in RUBRIC_DIMS)
+
+
+def passes_threshold(scores: dict) -> bool:
+    """Hard rule: approve only if acceptance >= 4 and no dimension < 2."""
+    if not scores:
+        return True  # no rubric provided (legacy) — don't block on it
+    if float(scores.get("acceptance", 0)) < 4:
+        return False
+    return all(float(scores.get(d, 0)) >= 2 for d in RUBRIC_DIMS)
+
 
 def _parse_verdict(text: str) -> dict:
     m = JSON_RE.search(text)
@@ -30,7 +47,27 @@ def _parse_verdict(text: str) -> dict:
         return {"decision": "revise", "notes": f"Reviewer returned bad JSON: {text[:500]}"}
     if verdict.get("decision") not in ("approve", "revise", "reject"):
         verdict["decision"] = "revise"
+    # Deterministic threshold guard: an "approve" with a failing scorecard is
+    # demoted to "revise" (repeatable, defensible verdicts).
+    if verdict["decision"] == "approve" and not passes_threshold(verdict.get("scores") or {}):
+        verdict["decision"] = "revise"
+        verdict["notes"] = ("rubric threshold not met (need acceptance>=4 and no "
+                            "dimension<2): " + str(verdict.get("scores"))
+                            + " | " + str(verdict.get("notes", "")))
     return verdict
+
+
+def _select_winner(verdict: dict, passed: dict) -> str:
+    """Rubric-driven selection: max weighted score among gate-passed candidates.
+    Prefers per-candidate scores; falls back to the stated winner, then (last
+    resort) the first passed candidate."""
+    by_cand = verdict.get("scores_by_candidate") or {}
+    scored = {cid: by_cand[cid] for cid in passed if cid in by_cand}
+    if scored:
+        return max(scored, key=lambda cid: weighted_score(scored[cid]))
+    if verdict.get("winner") in passed:
+        return verdict["winner"]
+    return next(iter(passed))
 
 
 async def review(ctx: RunContext, state: TaskState) -> dict:
@@ -64,8 +101,8 @@ async def review(ctx: RunContext, state: TaskState) -> dict:
         cost_usd=result.cost_usd)
 
     verdict = _parse_verdict(result.text)
-    if "winner" not in verdict or verdict["winner"] not in passed:
-        verdict["winner"] = next(iter(passed))
+    # Rubric-driven winner (max weighted score), not first-in-dict.
+    verdict["winner"] = _select_winner(verdict, passed)
     ctx.store.log_event(ctx.run_id, state["task_id"], "review",
                         json.dumps(verdict)[:2000])
     log.info("%s review: %s (winner=%s)", state["task_id"],

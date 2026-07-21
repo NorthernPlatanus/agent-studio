@@ -14,12 +14,40 @@ import logging
 import re
 
 from ..ops.backlog import make_backlog
+from ..ops import projectmap
 from ..core.context import RunContext
+from ..core.errors import PlannerNeedsInput
 from ..providers import get_provider
 
 log = logging.getLogger("orchestrator.planner")
 
 JSON_ARRAY_RE = re.compile(r"\[.*\]", re.S)
+JSON_OBJECT_RE = re.compile(r"\{.*\}", re.S)
+
+
+def parse_planner_output(text: str) -> dict:
+    """Accept BOTH the legacy bare `[specs]` array and the new tech-lead
+    envelope `{questions, assumptions, specs}`. Returns a normalized envelope.
+    A non-empty `questions` means the planner is asking, not planning."""
+    # Prefer the object envelope; fall back to a bare array (back-compat).
+    for rx in (JSON_OBJECT_RE, JSON_ARRAY_RE):
+        m = rx.search(text)
+        if not m:
+            continue
+        try:
+            data = json.loads(m.group(0))
+        except json.JSONDecodeError:
+            continue
+        if isinstance(data, list):
+            return {"questions": [], "assumptions": [], "specs": data}
+        if isinstance(data, dict):
+            if "specs" in data or "questions" in data:
+                return {"questions": data.get("questions") or [],
+                        "assumptions": data.get("assumptions") or [],
+                        "specs": data.get("specs") or []}
+            # a bare single-spec object
+            return {"questions": [], "assumptions": [], "specs": [data]}
+    raise ValueError(f"Planner returned no JSON array/object:\n{text[:1000]}")
 
 
 def _backlog_excerpt(ctx: RunContext, only_ids: list[str] | None) -> str:
@@ -44,18 +72,31 @@ def _backlog_excerpt(ctx: RunContext, only_ids: list[str] | None) -> str:
     return text
 
 
-async def plan(ctx: RunContext, discussion: str = "",
-               only_ids: list[str] | None = None) -> list[dict]:
+async def plan_or_ask(ctx: RunContext, *, discussion: str = "", transcript: str = "",
+                      only_ids: list[str] | None = None) -> dict:
+    """One planner turn. Returns the normalized envelope
+    {questions, assumptions, specs} WITHOUT persisting — so `discuss` can loop
+    and `plan` can decide what to do with questions. `transcript` carries the
+    running multi-turn conversation (the CLI planner is single-turn, so we pass
+    history in the prompt rather than via complete_chat)."""
     provider_name, model = ctx.role_target("planner")
     provider = get_provider(ctx.cfg, provider_name)
     system = ctx.cfg.prompt("planner")
 
-    existing = [t for t in ctx.store.all_tasks()]
+    existing = list(ctx.store.all_tasks())
     parts = ["# BACKLOG (source of truth)",
              _backlog_excerpt(ctx, only_ids), ""]
+    # Insert the structural project-map (if present) between the backlog and the
+    # current specs, so files_read authoring starts from a real skeleton.
+    map_file = projectmap.map_path(ctx.cfg)
+    if map_file.exists():
+        parts += ["# PROJECT MAP (structure — verify against it before listing files)",
+                  map_file.read_text()[:20000], ""]
     if existing:
         parts += ["# CURRENTLY PLANNED SPECS (update, don't duplicate)",
                   json.dumps(existing, indent=1)[:20000], ""]
+    if transcript:
+        parts += ["# CONVERSATION SO FAR (most recent last)", transcript, ""]
     if discussion:
         parts += ["# HUMAN NOTE — fold this into the plan", discussion, ""]
     proto = ctx.cfg.project.get("protocol_file")
@@ -71,12 +112,11 @@ async def plan(ctx: RunContext, discussion: str = "",
         provider_type=provider.type, model=model,
         input_tokens=result.input_tokens, output_tokens=result.output_tokens,
         cost_usd=result.cost_usd)
+    return parse_planner_output(result.text)
 
-    m = JSON_ARRAY_RE.search(result.text)
-    if not m:
-        raise ValueError(f"Planner returned no JSON array:\n{result.text[:1000]}")
-    specs = json.loads(m.group(0))
 
+def persist_specs(ctx: RunContext, specs: list[dict], note: str = "") -> list[dict]:
+    """Validate + upsert planner specs. Shared by `plan` and `discuss`."""
     for spec in specs:
         for key in ("id", "title", "description"):
             if not spec.get(key):
@@ -86,10 +126,20 @@ async def plan(ctx: RunContext, discussion: str = "",
         spec.pop("status", None)
         ctx.store.upsert_task(spec)
     ctx.store.log_event(ctx.run_id, None, "planned",
-                        f"{len(specs)} specs" + (f" (note: {discussion[:100]})"
-                                                 if discussion else ""))
+                        f"{len(specs)} specs" + (f" (note: {note[:100]})" if note else ""))
     log.info("planner produced %d task specs", len(specs))
     return specs
+
+
+async def plan(ctx: RunContext, discussion: str = "",
+               only_ids: list[str] | None = None) -> list[dict]:
+    """One-shot planning. If the tech-lead planner asks clarifying questions,
+    raise PlannerNeedsInput (the one-shot path must not silently guess —
+    requirements elicitation belongs in `discuss`)."""
+    env = await plan_or_ask(ctx, discussion=discussion, only_ids=only_ids)
+    if env["questions"]:
+        raise PlannerNeedsInput(env["questions"], env["assumptions"])
+    return persist_specs(ctx, env["specs"], note=discussion)
 
 
 def import_backlog_stubs(ctx: RunContext) -> int:

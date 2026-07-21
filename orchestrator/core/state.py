@@ -17,13 +17,24 @@ Candidate = dict[str, Any]
 #   cand_id: str        worker_models key ("deepseek"), unique per candidate
 #   model: str          resolved model id
 #   attempt: int        1-based; retries produce new entries (latest wins)
-#   status: str         gate_passed | gate_failed | patch_failed | llm_failed | skipped
+#   status: str         gate_passed | gate_failed | patch_failed | llm_failed
+#                       | visual_failed | skipped
+#                       (visual_failed = passed the deterministic gate but failed
+#                       the visual/runtime assertions; treated as not-green so the
+#                       dispatch retry branch reruns it — no empty-Send livelock)
 #   worktree: str       path
 #   branch: str         git branch
 #   diff: str           unified diff vs feature branch (on gate_passed)
 #   gate_log: str       failure tail (on gate_failed)
 #   error: str          patch/llm error text
 #   notes: str          worker's own plan/notes
+#   messages: list[dict] per-CANDIDATE warm chat history (plain role/content
+#                        dicts only — never LangChain message objects, or the
+#                        checkpoint breaks). Flows through the operator.add
+#                        reducer; latest_candidates() gives the warm chain per
+#                        candidate. This is per-candidate on purpose: a single
+#                        task-level add_messages channel would interleave all N
+#                        candidates' turns into one history.
 
 
 class TaskState(TypedDict, total=False):
@@ -34,6 +45,7 @@ class TaskState(TypedDict, total=False):
     attempt: int          # current attempt number (1-based)
     to_run: list[str]     # candidate ids to (re)run this attempt
     feedback: str         # gate/review notes injected into the next attempt
+    escalated: bool       # set once when a task hands off to the subscription senior
     candidates: Annotated[list[Candidate], operator.add]
     verdict: dict         # {"decision", "winner", "notes"}
     integration: dict     # {"merged_commit"}

@@ -11,6 +11,7 @@ import asyncio
 import logging
 
 from ..ops.backlog import make_backlog
+from ..ops import projectmap
 from ..core.context import RunContext
 from ..core.state import TaskState, latest_candidates
 
@@ -58,6 +59,14 @@ async def finalize(ctx: RunContext, state: TaskState) -> dict:
             backlog.set_status(task_id, "blocked", f"agent run {outcome} — needs human")
     except Exception as e:  # writeback must never kill a run
         log.warning("backlog writeback failed for %s: %s", task_id, e)
+
+    # Regenerate the structural project-map from the (post-merge) integration
+    # worktree. Serialized + guarded internally; a map failure never kills a run.
+    if outcome == "done":
+        try:
+            await projectmap.regenerate_from_integration(ctx)
+        except Exception as e:
+            log.warning("projectmap regeneration failed for %s: %s", task_id, e)
 
     # Worktree/branch cleanup for every candidate of this task.
     for cand in latest_candidates(state).values():

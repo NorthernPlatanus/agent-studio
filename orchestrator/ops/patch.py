@@ -23,6 +23,10 @@ from ..core.errors import PatchError
 FILE_RE = re.compile(r'<file\s+path="(?P<path>[^"]+)"\s*>\n?(?P<body>.*?)</file>', re.S)
 EDIT_RE = re.compile(r'<edit\s+path="(?P<path>[^"]+)"\s*>\n?(?P<body>.*?)</edit>', re.S)
 NEED_RE = re.compile(r"<need_files>\n?(?P<body>.*?)</need_files>", re.S)
+# Phase 2 read-only retrieval blocks (executed by the orchestrator, never applied).
+READ_RE = re.compile(r"<read>\n?(?P<body>.*?)</read>", re.S)
+GREP_RE = re.compile(r"<grep>\n?(?P<body>.*?)</grep>", re.S)
+LS_RE = re.compile(r"<ls>\n?(?P<body>.*?)</ls>", re.S)
 SR_RE = re.compile(
     r"<{7} SEARCH\n(?P<search>.*?)\n?={7}\n(?P<replace>.*?)\n?>{7} REPLACE", re.S
 )
@@ -32,7 +36,9 @@ SR_RE = re.compile(
 class ParsedResponse:
     files: dict[str, str] = field(default_factory=dict)          # path -> full content
     edits: dict[str, list[tuple[str, str]]] = field(default_factory=dict)  # path -> [(search, replace)]
-    need_files: list[str] = field(default_factory=list)
+    need_files: list[str] = field(default_factory=list)          # <read> + <need_files> (file-content requests)
+    grep: list[str] = field(default_factory=list)                # <grep> patterns
+    ls: list[str] = field(default_factory=list)                  # <ls> dirs
     plan: str = ""
 
     @property
@@ -40,15 +46,30 @@ class ParsedResponse:
         return set(self.files) | set(self.edits)
 
     @property
+    def has_retrieval(self) -> bool:
+        return bool(self.need_files or self.grep or self.ls)
+
+    @property
     def is_empty(self) -> bool:
-        return not self.files and not self.edits and not self.need_files
+        return not self.files and not self.edits and not self.has_retrieval
+
+
+def _lines(body: str) -> list[str]:
+    return [ln.strip() for ln in body.splitlines() if ln.strip()]
 
 
 def parse_worker_response(text: str) -> ParsedResponse:
     out = ParsedResponse()
+    # <read> generalizes <need_files>; both feed the file-content request list.
+    for m in READ_RE.finditer(text):
+        out.need_files.extend(_lines(m.group("body")))
     need = NEED_RE.search(text)
     if need:
-        out.need_files = [ln.strip() for ln in need.group("body").splitlines() if ln.strip()]
+        out.need_files.extend(_lines(need.group("body")))
+    for m in GREP_RE.finditer(text):
+        out.grep.extend(_lines(m.group("body")))
+    for m in LS_RE.finditer(text):
+        out.ls.extend(_lines(m.group("body")))
     for m in FILE_RE.finditer(text):
         out.files[m.group("path").strip()] = m.group("body")
     for m in EDIT_RE.finditer(text):

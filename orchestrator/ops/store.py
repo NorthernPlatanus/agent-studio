@@ -44,7 +44,9 @@ CREATE TABLE IF NOT EXISTS usage (
     input_tokens INTEGER NOT NULL DEFAULT 0,
     output_tokens INTEGER NOT NULL DEFAULT 0,
     cost_usd REAL NOT NULL DEFAULT 0,
-    cash INTEGER NOT NULL DEFAULT 1   -- 0 = subscription-covered (logged only)
+    cash INTEGER NOT NULL DEFAULT 1,   -- 0 = subscription-covered (logged only)
+    cache_hit_tokens INTEGER NOT NULL DEFAULT 0,
+    cache_miss_tokens INTEGER NOT NULL DEFAULT 0
 );
 CREATE TABLE IF NOT EXISTS events (
     ts REAL NOT NULL,
@@ -52,6 +54,11 @@ CREATE TABLE IF NOT EXISTS events (
     task_id TEXT,
     kind TEXT NOT NULL,
     detail TEXT
+);
+CREATE TABLE IF NOT EXISTS discussions (
+    session TEXT PRIMARY KEY,       -- usually the project name
+    transcript TEXT NOT NULL,
+    updated_at REAL NOT NULL
 );
 """
 
@@ -62,7 +69,18 @@ class Store:
         self._conn = sqlite3.connect(self.path)
         self._conn.row_factory = sqlite3.Row
         self._conn.executescript(SCHEMA)
+        self._migrate()
         self._conn.commit()
+
+    def _migrate(self) -> None:
+        """Tolerant, additive migrations for pre-existing state files. CREATE
+        TABLE IF NOT EXISTS won't add columns to an old `usage` table, so add
+        them guarded by a column-exists check."""
+        cols = {r["name"] for r in self._conn.execute("PRAGMA table_info(usage)")}
+        for col in ("cache_hit_tokens", "cache_miss_tokens"):
+            if col not in cols:
+                self._conn.execute(
+                    f"ALTER TABLE usage ADD COLUMN {col} INTEGER NOT NULL DEFAULT 0")
 
     # ---- tasks ----------------------------------------------------------
     def upsert_task(self, spec: dict[str, Any]) -> None:
@@ -148,11 +166,16 @@ class Store:
     # ---- usage / budget --------------------------------------------------
     def record_usage(self, run_id: str | None, task_id: str | None, role: str,
                      provider: str, model: str, input_tokens: int,
-                     output_tokens: int, cost_usd: float, cash: bool) -> None:
+                     output_tokens: int, cost_usd: float, cash: bool,
+                     cache_hit_tokens: int = 0, cache_miss_tokens: int = 0) -> None:
         self._conn.execute(
-            "INSERT INTO usage VALUES(?,?,?,?,?,?,?,?,?,?)",
+            """INSERT INTO usage(ts, run_id, task_id, role, provider, model,
+                                 input_tokens, output_tokens, cost_usd, cash,
+                                 cache_hit_tokens, cache_miss_tokens)
+               VALUES(?,?,?,?,?,?,?,?,?,?,?,?)""",
             (time.time(), run_id, task_id, role, provider, model,
-             input_tokens, output_tokens, cost_usd, 1 if cash else 0))
+             input_tokens, output_tokens, cost_usd, 1 if cash else 0,
+             cache_hit_tokens, cache_miss_tokens))
         if cash:
             if task_id:
                 self.add_task_cost(task_id, cost_usd)
@@ -178,10 +201,26 @@ class Store:
         rows = self._conn.execute(
             """SELECT role, provider, model, COUNT(*) calls,
                       SUM(input_tokens) in_tok, SUM(output_tokens) out_tok,
+                      SUM(cache_hit_tokens) cache_hit, SUM(cache_miss_tokens) cache_miss,
                       SUM(cost_usd) cost, MAX(cash) cash
                FROM usage GROUP BY role, provider, model ORDER BY cost DESC"""
         ).fetchall()
         return [dict(r) for r in rows]
+
+    # ---- discussions (interactive `discuss` transcript) ------------------
+    def save_discussion(self, session: str, transcript: str) -> None:
+        self._conn.execute(
+            """INSERT INTO discussions(session, transcript, updated_at)
+               VALUES(?,?,?)
+               ON CONFLICT(session) DO UPDATE SET
+                 transcript=excluded.transcript, updated_at=excluded.updated_at""",
+            (session, transcript, time.time()))
+        self._conn.commit()
+
+    def load_discussion(self, session: str) -> str:
+        row = self._conn.execute(
+            "SELECT transcript FROM discussions WHERE session=?", (session,)).fetchone()
+        return row["transcript"] if row else ""
 
     # ---- events ----------------------------------------------------------
     def log_event(self, run_id: str | None, task_id: str | None,
