@@ -71,7 +71,8 @@ def run_retrieval_requests(ctx: RunContext, worktree: Path, parsed, *,
     return "\n".join(out)
 
 
-def _build_stable_prompt(ctx: RunContext, spec: dict, files: dict[str, str]) -> str:
+def _build_stable_prompt(ctx: RunContext, spec: dict, files: dict[str, str],
+                         approach: str | None = None) -> str:
     """The FROZEN first turn: task spec + protocol + files in a fixed order.
 
     This is the cache prefix. It is built exactly once per candidate (attempt 1)
@@ -79,7 +80,12 @@ def _build_stable_prompt(ctx: RunContext, spec: dict, files: dict[str, str]) -> 
     turns (the volatile suffix), so retries bill at the cached input rate. The
     caller is responsible for passing `files` already sorted-once; do NOT fold
     later-granted files back into this block (that would insert bytes mid-prefix
-    and break byte-stability)."""
+    and break byte-stability).
+
+    `approach` is the per-candidate best-of-N hint (constant for a candidate
+    across retries, so its cache does not break; it differs across candidates,
+    which is the point). Appended at the very end so the shared task+protocol+
+    files prefix stays byte-identical across candidates on one model."""
     parts = [f"# TASK {spec['id']}: {spec['title']}", "", spec["description"], ""]
     if spec.get("acceptance"):
         parts.append("## Acceptance criteria")
@@ -108,6 +114,8 @@ def _build_stable_prompt(ctx: RunContext, spec: dict, files: dict[str, str]) -> 
         parts.append(f'<source path="{rel}">')
         parts.append(content if content is not None else "<< FILE DOES NOT EXIST YET >>")
         parts.append("</source>")
+    if approach:
+        parts += [f"# APPROACH\n{approach}", ""]
     return "\n".join(parts)
 
 
@@ -129,6 +137,16 @@ async def run_candidate(ctx: RunContext, payload: dict) -> dict:
     provider_name, model = ctx.worker_target(cand_id)
     provider = get_provider(ctx.cfg, provider_name)
     wt_name = f"{task_id}-{cand_id}".lower()
+
+    # Per-candidate best-of-N knobs: sampling `params` + an `approach` hint,
+    # pulled from the worker_models entry. The `senior` escalation pseudo-
+    # candidate is NOT a worker_models key (it resolves to the subscription smart
+    # tier), so it has neither — both stay None (no crash; the CLI senior ignores
+    # params, and no approach is appended to its prefix).
+    entry = ctx.cfg.worker_models.get(cand_id) if cand_id != "senior" else None
+    edict = entry.as_dict() if entry is not None else {}
+    params = edict.get("params")
+    approach = edict.get("approach")
 
     cand: Candidate = {"cand_id": cand_id, "model": model, "attempt": attempt,
                        "status": "llm_failed", "worktree": "", "branch": "",
@@ -158,10 +176,16 @@ async def run_candidate(ctx: RunContext, payload: dict) -> dict:
                     list(spec.get("files_read") or []) + list(spec.get("files_write") or []))):
                 files[rel] = _read_task_file(ctx, worktree, rel)
             messages.append({"role": "user",
-                             "content": _build_stable_prompt(ctx, spec, files)})
-        elif feedback:
-            # Continuation (retry / review-fix): append feedback as a NEW turn,
-            # never inserted before the frozen prefix.
+                             "content": _build_stable_prompt(ctx, spec, files,
+                                                             approach=approach)})
+        if feedback:
+            # Append feedback as a NEW turn after the (possibly just-built) frozen
+            # prefix — never inserted before it. This is `if`, not `elif`, so a
+            # fresh chain that is nonetheless dispatched WITH feedback still sees
+            # it: the escalation senior has empty prior `messages` but carries the
+            # prior-failure log as feedback, and an `elif` here would silently drop
+            # that context. On attempt 1 `feedback` is always "" (no-op); on
+            # retries `messages` is non-empty and this appends as before.
             messages.append({"role": "user",
                              "content": f"## RETRY FEEDBACK — fix exactly this\n{feedback}"})
 
@@ -178,7 +202,8 @@ async def run_candidate(ctx: RunContext, payload: dict) -> dict:
         cwd = str(worktree)
         while True:
             result = await provider.complete_chat(
-                model=model, system=system, messages=messages, cwd=cwd)
+                model=model, system=system, messages=messages, cwd=cwd,
+                params=params)
             messages.append({"role": "assistant", "content": result.text})
             ctx.budget.record(
                 task_id=task_id, role=f"worker:{cand_id}", provider=provider_name,

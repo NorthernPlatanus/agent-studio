@@ -26,8 +26,8 @@ class _Cliish(LLMProvider):
         super().__init__("p", None, None)
         self.seen = None
 
-    async def complete(self, *, model, system, user, cwd=None):
-        self.seen = {"system": system, "user": user, "cwd": cwd}
+    async def complete(self, *, model, system, user, cwd=None, params=None):
+        self.seen = {"system": system, "user": user, "cwd": cwd, "params": params}
         return LLMResult(text="ok")
 
 
@@ -126,6 +126,21 @@ async def test_retrieved_files_not_folded_into_prefix(tmp_path, monkeypatch):
                for m in msgs if m["role"] == "user")          # in a later suffix turn
 
 
+async def test_fresh_chain_with_feedback_includes_it(tmp_path, monkeypatch):
+    # Regression (F2): the escalation senior is a FRESH candidate (empty prior
+    # `messages`) dispatched WITH feedback (the prior-failure log). The feedback
+    # must reach the prompt — an `elif feedback` after the prefix branch silently
+    # drops it, leaving the expensive senior blind to what the cheap workers hit.
+    ctx = _ctx(tmp_path)
+    provider = ScriptedProvider(['<file path="a.txt">\nx\n</file>'])
+    out = await _run(ctx, provider, monkeypatch, attempt=5, messages=[],
+                     feedback="ESCALATED: prior workers failed:\nboom")
+    msgs = out["candidates"][0]["messages"]
+    assert "ESCALATED" not in msgs[0]["content"]              # frozen prefix untouched
+    assert any("ESCALATED" in m["content"]
+               for m in msgs[1:] if m["role"] == "user")      # feedback in a later turn
+
+
 # ---- escalation routing ------------------------------------------------------
 
 def _cfg_escalation(max_fix=2, on=True):
@@ -177,6 +192,26 @@ def test_no_escalation_when_disabled_uses_retries():
     # falls back to legacy: attempt(2) < max_retries(5) -> dispatch (ordinary retry)
     assert decide_after_collect(cfg, _red(2)) == "dispatch"
     assert plan_dispatch(cfg, _red(2))["to_run"] == ["w"]
+
+
+def test_escalation_reachable_when_max_fix_exceeds_max_retries():
+    # Regression (F1): with the shipped-default shape max_fix_rounds (4) >
+    # max_retries (3), escalation must still be reachable. When the ladder is on
+    # the cheap loop is bounded by max_fix_rounds, not the smaller max_retries;
+    # otherwise a red task finalizes at attempt==max_retries and never escalates.
+    cfg = Config({"run": {"escalate_on_exhaustion": True, "max_fix_rounds": 4,
+                          "max_retries": 3, "n_candidates": 1},
+                  "roles": {"worker": {"default": "w", "candidates": ["w"]}},
+                  "gate": {"log_tail_chars": 500}}, "p", Path("/tmp"))
+    # cheap loop keeps retrying past max_retries(3), up to max_fix_rounds(4)
+    assert decide_after_collect(cfg, _red(3)) == "dispatch"
+    # at max_fix_rounds the still-red task escalates to the senior (not finalize)
+    assert decide_after_collect(cfg, _red(4)) == "dispatch"
+    assert plan_dispatch(cfg, _red(4))["to_run"] == ["senior"]
+    # after the senior also fails, the once-guard finalizes it
+    st = _red(5)
+    st["escalated"] = True
+    assert decide_after_collect(cfg, st) == "finalize"
 
 
 # ---- usage-table migration ---------------------------------------------------

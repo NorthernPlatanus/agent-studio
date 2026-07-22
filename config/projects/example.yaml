@@ -35,8 +35,13 @@ worker_models:
   example_model: {provider: example_provider, model: some-model-id, input_per_mtok: 0.50, output_per_mtok: 1.50}
 
 roles:
-  planner:  {provider: claude_cli, model: opus}
-  reviewer: {provider: claude_cli, model: opus}
+  # smart_provider drives BOTH planner and reviewer (the whole "thinking tier").
+  # Flip it to codex_cli to A/B Claude vs Codex in one line; leave the per-role
+  # provider null so it inherits (an explicit provider would pin the role and
+  # defeat the switch — see README "The economic model").
+  smart_provider: claude_cli        # claude_cli | codex_cli
+  planner:  {provider: null, model: opus}
+  reviewer: {provider: null, model: opus}
   worker:
     default: example_model          # REQUIRED: key into worker_models
     candidates: [example_model]     # pool for best-of-N

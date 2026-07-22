@@ -75,13 +75,14 @@ class ScriptedProvider:
         self.calls = 0
         self.last_messages = None
 
-    async def complete(self, *, model, system, user, cwd=None):
+    async def complete(self, *, model, system, user, cwd=None, params=None):
         text = self.responses[min(self.calls, len(self.responses) - 1)]
         self.calls += 1
         return LLMResult(text=text)
 
-    async def complete_chat(self, *, model, system, messages, cwd=None):
+    async def complete_chat(self, *, model, system, messages, cwd=None, params=None):
         self.last_messages = messages
+        self.last_params = params
         text = self.responses[min(self.calls, len(self.responses) - 1)]
         self.calls += 1
         return LLMResult(text=text)

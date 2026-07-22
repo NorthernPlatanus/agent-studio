@@ -91,3 +91,21 @@ def test_degrade_reroutes_to_worker_even_with_codex_planner():
         degraded=True,
     )
     assert ctx.role_target("planner") == ("cometapi", "deepseek")
+
+
+def test_provider_cache_is_per_config():
+    # Regression (F4): the provider cache must isolate distinct Config objects.
+    # A process-global name->instance cache would hand cfg2 the provider bound to
+    # cfg1 (stale base_url / price table / env key).
+    from orchestrator.providers import get_provider
+
+    data = {"providers": {"p": {"type": "openai_compatible",
+                                "base_url": "http://a", "api_key_env": "X"}},
+            "worker_models": {}}
+    cfg1 = Config(dict(data), "proj", Path("/tmp"))
+    cfg2 = Config(dict(data), "proj", Path("/tmp"))
+    p1, p1_again = get_provider(cfg1, "p"), get_provider(cfg1, "p")
+    p2 = get_provider(cfg2, "p")
+    assert p1 is p1_again          # cached within a single Config
+    assert p1 is not p2            # a different Config gets its own instance
+    assert p2.cfg is cfg2          # and it is bound to the right Config
