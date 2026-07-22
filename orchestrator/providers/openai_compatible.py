@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import logging
 import os
+import re
 
 from openai import AsyncOpenAI
 
@@ -15,6 +16,18 @@ from ..core.errors import OrchestratorError
 from .base import LLMProvider, LLMResult
 
 log = logging.getLogger("orchestrator.openai_compatible")
+
+# Sampling/generation knobs we forward to chat.completions.create(). A stray key
+# outside this set is dropped BEFORE the call (an unknown kwarg is a client-side
+# TypeError otherwise); a whitelisted key the endpoint still rejects at runtime
+# (e.g. `seed` on a provider that doesn't implement it) is dropped by the
+# tolerant 400 retry in _chat. `extra_body` is the escape hatch for
+# provider-specific fields (top_k, min_p, repetition_penalty, ...).
+_SAMPLING_KEYS = frozenset({
+    "temperature", "top_p", "frequency_penalty", "presence_penalty", "seed",
+    "stop", "max_tokens", "max_completion_tokens", "logit_bias", "n",
+    "logprobs", "top_logprobs", "response_format", "extra_body",
+})
 
 
 class OpenAICompatibleProvider(LLMProvider):
@@ -43,27 +56,44 @@ class OpenAICompatibleProvider(LLMProvider):
                 )
 
     async def complete(self, *, model: str, system: str, user: str,
-                       cwd: str | None = None) -> LLMResult:
+                       cwd: str | None = None,
+                       params: dict | None = None) -> LLMResult:
         return await self._chat(model, [
             {"role": "system", "content": system},
             {"role": "user", "content": user},
-        ])
+        ], params)
 
     async def complete_chat(self, *, model: str, system: str,
-                            messages: list[dict], cwd: str | None = None) -> LLMResult:
+                            messages: list[dict], cwd: str | None = None,
+                            params: dict | None = None) -> LLMResult:
         """Pass the native OpenAI messages array through so the endpoint's
         automatic prefix caching sees a byte-stable prefix across turns."""
         wire = [{"role": "system", "content": system}] + [
             {"role": m["role"], "content": m["content"]} for m in messages
             if m.get("role") != "system"]
-        return await self._chat(model, wire)
+        return await self._chat(model, wire, params)
 
-    async def _chat(self, model: str, messages: list[dict]) -> LLMResult:
-        try:
-            resp = await self.client.chat.completions.create(
-                model=model, messages=messages)
-        except Exception as e:  # surfaced as a candidate failure, not a crash
-            raise OrchestratorError(f"{self.name}/{model} call failed: {e}") from e
+    async def _chat(self, model: str, messages: list[dict],
+                    params: dict | None = None) -> LLMResult:
+        # Only forward recognized sampling keys; a whitelisted key the endpoint
+        # rejects at runtime (HTTP 400 naming the field) is dropped and retried
+        # so one unsupported knob (e.g. `seed`) never fails the whole candidate.
+        attempted = _safe_params(params)
+        while True:
+            try:
+                resp = await self.client.chat.completions.create(
+                    model=model, messages=messages, **attempted)
+                break
+            except Exception as e:  # surfaced as a candidate failure, not a crash
+                rejected = ([k for k in attempted if _names_param(e, k)]
+                            if getattr(e, "status_code", None) == 400 else [])
+                if not rejected:
+                    raise OrchestratorError(
+                        f"{self.name}/{model} call failed: {e}") from e
+                for k in rejected:
+                    attempted.pop(k, None)
+                log.warning("%s/%s rejected sampling param(s) %s; retrying without",
+                            self.name, model, ", ".join(rejected))
 
         text = (resp.choices[0].message.content or "") if resp.choices else ""
         usage = resp.usage
@@ -75,6 +105,29 @@ class OpenAICompatibleProvider(LLMProvider):
         return LLMResult(text=text, input_tokens=in_tok, output_tokens=out_tok,
                          cost_usd=cost, model=model, raw=resp,
                          cache_hit_tokens=hit, cache_miss_tokens=miss)
+
+
+def _safe_params(params: dict | None) -> dict:
+    """Keep only recognized sampling keys; warn on anything dropped (a stray
+    key would raise a client-side TypeError inside create())."""
+    if not params:
+        return {}
+    safe: dict = {}
+    unknown: list[str] = []
+    for k, v in dict(params).items():
+        if k in _SAMPLING_KEYS:
+            safe[k] = v
+        else:
+            unknown.append(k)
+    if unknown:
+        log.warning("dropping unrecognized sampling param(s): %s", ", ".join(unknown))
+    return safe
+
+
+def _names_param(err: Exception, key: str) -> bool:
+    """True if the error text names `key` as a standalone token — used to drop a
+    param the endpoint rejected (e.g. \"Unsupported parameter: 'seed'\") and retry."""
+    return re.search(rf"\b{re.escape(key)}\b", str(err)) is not None
 
 
 def _cache_tokens(usage, in_tok: int) -> tuple[int, int]:

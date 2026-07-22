@@ -225,8 +225,11 @@ class Store:
     # ---- events ----------------------------------------------------------
     def log_event(self, run_id: str | None, task_id: str | None,
                   kind: str, detail: str = "") -> None:
-        self._conn.execute("INSERT INTO events VALUES(?,?,?,?,?)",
-                           (time.time(), run_id, task_id, kind, detail))
+        # Named columns (not positional VALUES) so a future events-schema change
+        # can't silently misalign — the same hardening applied to `usage` (N12).
+        self._conn.execute(
+            "INSERT INTO events(ts, run_id, task_id, kind, detail) VALUES(?,?,?,?,?)",
+            (time.time(), run_id, task_id, kind, detail))
         self._conn.commit()
 
     def close(self) -> None:

@@ -11,9 +11,13 @@ Invariants honored:
     to `read-only` so planner/reviewer never edit the repo — same guarantee as
     claude_cli's `allowed_tools: "Read,Grep,Glob"`.
   * MCP is best-effort and OFF by default (enable_mcp: false). `codex exec`
-    cannot approve MCP tool calls without a dangerous bypass, so we NEVER trade
-    away the sandbox to enable it (Fable N6): if MCP can't be granted safely we
-    simply degrade (skip MCP for that role).
+    cannot approve MCP tool calls without a dangerous bypass, so by default we do
+    NOT trade away the sandbox to enable it (Fable N6): if MCP can't be granted
+    safely we simply degrade (skip MCP for that role). The one opt-in escape is
+    Fix 2's `mcp_bypass` — gated behind BOTH enable_mcp and mcp_bypass, OFF by
+    default, loudly named — a temporary workaround for openai/codex#24135 that
+    swaps --sandbox for --dangerously-bypass-approvals-and-sandbox. Enable ONLY
+    inside a disposable worktree/container.
 
 Codex has no `--append-system-prompt` analogue, so the system text is prepended
 to the user prompt.
@@ -111,7 +115,11 @@ class CodexCliProvider(LLMProvider):
         return text, in_tok, out_tok
 
     async def complete(self, *, model: str, system: str, user: str,
-                       cwd: str | None = None) -> LLMResult:
+                       cwd: str | None = None,
+                       params: dict | None = None) -> LLMResult:
+        # `params` (sampling overrides) is accepted for signature parity and
+        # ignored: `codex exec` has no convenient temperature flag, and the spec
+        # is explicit about not forcing one on the CLI tier.
         binary = os.environ.get("CODEX_BIN", self.pcfg.binary)
         prompt = f"{system}\n\n{user}" if system else user
 
@@ -120,20 +128,25 @@ class CodexCliProvider(LLMProvider):
         last_msg_path = last_msg.name
         last_msg.close()
 
-        args = [
-            binary, "exec",
-            "--json",
-            "--skip-git-repo-check",
-            "--sandbox", self._sandbox_mode(),
-            "--model", model,
-            "--output-last-message", last_msg_path,
-        ]
+        # MCP bypass (Fix 2): `codex exec` cannot approve MCP tool calls
+        # non-interactively without --dangerously-bypass-approvals-and-sandbox
+        # (openai/codex#24135, open). Gated behind BOTH enable_mcp AND the
+        # loudly-named mcp_bypass, OFF by default. The bypass REMOVES the sandbox,
+        # so we must NOT also pass --sandbox (a flag conflict) — the two are
+        # mutually exclusive here.
+        bypass = bool(self.pcfg.get("enable_mcp")) and bool(self.pcfg.get("mcp_bypass"))
+        args = [binary, "exec", "--json", "--skip-git-repo-check"]
+        if bypass:
+            args += ["--dangerously-bypass-approvals-and-sandbox"]  # TEMPORARY: until #24135
+        else:
+            args += ["--sandbox", self._sandbox_mode()]
+        args += ["--model", model, "--output-last-message", last_msg_path]
         args += self._mcp_config_args()
         args += [prompt]
 
         timeout = int(self.pcfg.get("timeout_s", 600))
         log.debug("codex_cli: %s exec ... (cwd=%s, sandbox=%s)",
-                  binary, cwd, self._sandbox_mode())
+                  binary, cwd, "bypass" if bypass else self._sandbox_mode())
         proc = await asyncio.create_subprocess_exec(
             *args, cwd=cwd,
             stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE)

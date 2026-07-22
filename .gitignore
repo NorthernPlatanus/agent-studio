@@ -19,6 +19,8 @@ docs/
 *_pat.txt
 *.pat
 .secrets/
+# Reversible removals staged by automated audit/fix runs (never hard-deleted).
+.trash/
 
 # Operator config and policy, not repo content.
 .claude/

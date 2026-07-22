@@ -44,6 +44,10 @@ providers:
     auth: subscription              # subscription (logged, not counted) | api (counted vs cash budget)
     enable_mcp: false               # best-effort MCP translation; codex exec cannot approve MCP calls
                                     # without a dangerous bypass, so OFF by default (never weakens sandbox)
+    mcp_bypass: false               # TEMPORARY workaround for openai/codex#24135: adds
+                                    # --dangerously-bypass-approvals-and-sandbox (and drops --sandbox) so
+                                    # codex exec can run MCP tools non-interactively. Requires enable_mcp too.
+                                    # Removes the sandbox — enable ONLY inside a disposable worktree/container.
     timeout_s: 600
 
 worker_models: {}     # per project: name -> {provider, model, input_per_mtok, output_per_mtok}

@@ -79,9 +79,19 @@ def test_check_disabled_passes_through():
 def test_check_passes_and_fails_via_injected_facts(tmp_path):
     cfg = _cfg()
     ok = vg.check(cfg, tmp_path, fetch_facts=lambda: {"scene": {"visibleMeshCount": 2}})
-    assert ok.passed is True
+    assert ok.passed is True and ok.enforced is True
     bad = vg.check(cfg, tmp_path, fetch_facts=lambda: {"scene": {"visibleMeshCount": 0}})
     assert bad.passed is False and bad.failures == ["scene.visibleMeshCount > 0"]
+    assert bad.enforced is True
+
+
+def test_check_enabled_without_inspector_is_unenforced_passthrough(tmp_path):
+    # Regression (F3): enabled but no fact source -> passes through, but flagged
+    # enforced=False so the node can log an auditable `visual_gate_skipped` event
+    # instead of masquerading as a real visual pass.
+    cfg = _cfg()
+    res = vg.check(cfg, tmp_path)          # no fetch_facts wired (production reality)
+    assert res.passed is True and res.enforced is False
 
 
 # ---- routing ----------------------------------------------------------------

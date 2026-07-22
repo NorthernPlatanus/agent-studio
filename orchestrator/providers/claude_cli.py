@@ -33,7 +33,11 @@ class ClaudeCliProvider(LLMProvider):
     type = "claude_cli"
 
     async def complete(self, *, model: str, system: str, user: str,
-                       cwd: str | None = None) -> LLMResult:
+                       cwd: str | None = None,
+                       params: dict | None = None) -> LLMResult:
+        # `params` (sampling overrides) is accepted for signature parity and
+        # ignored: `claude -p` has no convenient temperature flag, and the spec
+        # is explicit about not forcing one on the CLI tier.
         binary = os.environ.get("CLAUDE_BIN", self.pcfg.binary)
         args = [
             binary, "-p", user,

@@ -30,12 +30,17 @@ class LLMProvider(ABC):
 
     @abstractmethod
     async def complete(self, *, model: str, system: str, user: str,
-                       cwd: str | None = None) -> LLMResult:
+                       cwd: str | None = None,
+                       params: dict | None = None) -> LLMResult:
         """Single-turn completion. `cwd` only matters for CLI providers with
-        repo read access."""
+        repo read access. `params` carries optional per-candidate sampling
+        overrides (temperature/top_p/seed/...); CLI providers accept and ignore
+        it (no convenient temperature flag on `claude -p` / `codex exec`), while
+        openai_compatible spreads it into the chat-completions call."""
 
     async def complete_chat(self, *, model: str, system: str,
-                            messages: list[dict], cwd: str | None = None) -> LLMResult:
+                            messages: list[dict], cwd: str | None = None,
+                            params: dict | None = None) -> LLMResult:
         """Multi-turn completion over role/content dicts.
 
         Default implementation is the stable-prefix passthrough: it flattens the
@@ -46,4 +51,5 @@ class LLMProvider(ABC):
         """
         user = "\n\n".join(
             m["content"] for m in messages if m.get("role") != "system")
-        return await self.complete(model=model, system=system, user=user, cwd=cwd)
+        return await self.complete(model=model, system=system, user=user,
+                                   cwd=cwd, params=params)

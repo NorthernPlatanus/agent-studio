@@ -202,6 +202,11 @@ class VisualResult:
     passed: bool
     failures: list[str] = field(default_factory=list)
     facts: dict = field(default_factory=dict)
+    # True only when assertions were actually evaluated against real inspector
+    # facts. A disabled gate or an enabled-but-no-fact-source pass-through returns
+    # enforced=False, so callers can distinguish a genuine visual PASS from a blind
+    # pass-through and surface the latter (see visual_gate node's skipped event).
+    enforced: bool = False
 
 
 def _spawn(run_cmd: str, cwd: Path) -> subprocess.Popen:
@@ -256,6 +261,7 @@ def check(cfg, worktree: Path, *, fetch_facts=None, wait_ready=None) -> VisualRe
             return VisualResult(passed=True)
         facts = fetch_facts()
         failures = run_assertions(assertions, facts)
-        return VisualResult(passed=not failures, failures=failures, facts=facts)
+        return VisualResult(passed=not failures, failures=failures, facts=facts,
+                            enforced=True)
     finally:
         _teardown(proc)

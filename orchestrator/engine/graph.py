@@ -138,7 +138,20 @@ def _decide_when_not_green(cfg, state: TaskState, latest: dict) -> str:
         return "finalize"        # the senior already tried and failed -> human
     if escalation_ready(cfg, state, latest, state["attempt"]):
         return "dispatch"        # dispatch will take the escalation branch
-    if state["attempt"] < int(cfg.run.max_retries):
+    # Cheap-loop retry ceiling. With the escalation ladder ON, the warm cheap loop
+    # is bounded by max_fix_rounds (the documented "fix depth before escalation");
+    # escalation_ready fires at attempt >= max_fix_rounds just above. Bounding the
+    # retry here by max_retries instead would finalize a red task at
+    # attempt == max_retries BEFORE the escalation trigger could fire whenever
+    # max_fix_rounds > max_retries (the shipped default is 4 > 3), silently
+    # disabling the whole ladder. With the ladder OFF, the legacy max_retries
+    # bound applies unchanged.
+    run = cfg.run
+    if bool(run.get("escalate_on_exhaustion", False)):
+        ceiling = int(run.get("max_fix_rounds", run.get("max_retries", 3)))
+    else:
+        ceiling = int(run.max_retries)
+    if state["attempt"] < ceiling:
         return "dispatch"
     return "finalize"
 
@@ -211,8 +224,14 @@ def build_task_graph(ctx: RunContext):
                 log.warning("%s visual_gate error for %s: %s",
                             state["task_id"], cid, e)
                 continue
-            ctx.store.log_event(ctx.run_id, state["task_id"], "visual_gate",
-                                f"{cid} passed={res.passed} failures={res.failures}")
+            # `visual_gate_skipped` (distinct kind, visible in status/events) makes
+            # a blind pass-through auditable: the gate is enabled but no inspector
+            # is wired, so the candidate passed WITHOUT any assertion running —
+            # never let that masquerade as a real visual pass.
+            kind = "visual_gate" if res.enforced else "visual_gate_skipped"
+            ctx.store.log_event(ctx.run_id, state["task_id"], kind,
+                                f"{cid} enforced={res.enforced} passed={res.passed} "
+                                f"failures={res.failures}")
             if not res.passed:
                 nc = dict(cand)
                 nc["status"] = "visual_failed"
