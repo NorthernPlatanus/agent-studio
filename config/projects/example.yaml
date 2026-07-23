@@ -1,6 +1,7 @@
 # ============================================================================
-# TEMPLATE project profile — copy this file to config/projects/<yourname>.yaml
-# and fill in the fields below for the repo you want the orchestrator to work
+# TEMPLATE project profile — copy this file to projects/<yourname>/profile.yaml
+# (the gitignored per-project tree) and fill in the fields below for the repo
+# you want the orchestrator to work
 # on. Everything here is a placeholder; nothing in this file should be treated
 # as a real value. Machine-specific values (absolute paths) belong in
 # config/local.yaml (gitignored, see config/local.yaml.example) instead of
@@ -23,16 +24,27 @@ paths:
   work_dir: null                    # REQUIRED; also fine to set via config/local.yaml
 
 providers:
-  # Example OpenAI-compatible aggregator entry — replace with your own.
-  example_provider:
+  # CometAPI: one OpenAI-compatible endpoint for DeepSeek/GLM/Kimi/etc.
+  cometapi:
     type: openai_compatible
-    base_url: https://api.example.com/v1
-    api_key_env: EXAMPLE_PROVIDER_KEY
+    base_url: https://api.cometapi.com/v1
+    api_key_env: COMETAPI_KEY
     timeout_s: 300
 
-# VERIFY exact model ids and prices against your provider's current list.
+# VERIFY exact model ids and prices against CometAPI's current list — ids rotate.
+# Best-of-N brainstorm: three DeepSeek V4 Flash candidates on ONE cheap model,
+# differentiated by CONSERVATIVE sampling + a static `approach` hint (appended to
+# the worker's stable prefix). Same model, three behaviors — good for comparing
+# how the model responds to different framings while the free gate culls losers.
+# NOTE: `approach` is static config for now; a future version may let the planner
+# assign it per-task (see the gitignored docs/FUTURE_NOTES.md).
 worker_models:
-  example_model: {provider: example_provider, model: some-model-id, input_per_mtok: 0.50, output_per_mtok: 1.50}
+  flash_lo:  {provider: cometapi, model: deepseek-v4-flash, input_per_mtok: 0.12, output_per_mtok: 0.24,
+              params: {temperature: 0.2}, approach: "Simplest correct solution. Minimal diff, no refactoring beyond the task, no cleverness."}
+  flash_mid: {provider: cometapi, model: deepseek-v4-flash, input_per_mtok: 0.12, output_per_mtok: 0.24,
+              params: {temperature: 0.5}, approach: "Balanced: correct, readable, idiomatic to the surrounding code."}
+  flash_hi:  {provider: cometapi, model: deepseek-v4-flash, input_per_mtok: 0.12, output_per_mtok: 0.24,
+              params: {temperature: 0.8}, approach: "Thorough: handle edge cases, invalid input, and error paths explicitly."}
 
 roles:
   # smart_provider drives BOTH planner and reviewer (the whole "thinking tier").
@@ -43,12 +55,13 @@ roles:
   planner:  {provider: null, model: opus}
   reviewer: {provider: null, model: opus}
   worker:
-    default: example_model          # REQUIRED: key into worker_models
-    candidates: [example_model]     # pool for best-of-N
+    default: flash_mid              # used when n_candidates == 1
+    candidates: [flash_lo, flash_mid, flash_hi]   # best-of-N pool (order-independent)
 
 run:
+  n_candidates: 3                   # best-of-3 across the three Flash behaviors
   on_limit_exhausted: pause
-  degrade_model: example_model
+  degrade_model: flash_lo           # if the smart tier hits its limit, reroute it here
 
 gate:
   install_cmd: null       # e.g. "npm ci", "pip install -e .[dev]", "cargo fetch"
