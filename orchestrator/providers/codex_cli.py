@@ -73,12 +73,15 @@ class CodexCliProvider(LLMProvider):
         return args
 
     @staticmethod
-    def _parse_events(stdout: str) -> tuple[str, int, int]:
-        """Tolerant JSONL parse: return (final_text, input_tokens, output_tokens).
-        Codex event schema varies across releases, so we scan defensively and
-        keep the last text-bearing event as the final message."""
+    def _parse_events(stdout: str) -> tuple[str, int, int, int]:
+        """Tolerant JSONL parse: return (final_text, input_tokens, output_tokens,
+        cached_input_tokens). Codex event schema varies across releases, so we
+        scan defensively and keep the last text-bearing event as the final
+        message. `cached` is 0 when the release reports no cache field — never
+        guessed, so a 0 hit-rate in the ledger reads as "unknown or cold", which
+        is the honest reading either way."""
         text = ""
-        in_tok = out_tok = 0
+        in_tok = out_tok = cached = 0
         for line in stdout.splitlines():
             line = line.strip()
             if not line:
@@ -95,6 +98,7 @@ class CodexCliProvider(LLMProvider):
                              usage.get("prompt_tokens", in_tok)) or in_tok)
                 out_tok = int(usage.get("output_tokens",
                               usage.get("completion_tokens", out_tok)) or out_tok)
+                cached = _cached_input_tokens(usage) or cached
             cand = None
             if isinstance(ev.get("text"), str):
                 cand = ev["text"]
@@ -112,11 +116,22 @@ class CodexCliProvider(LLMProvider):
                         cand = msg["text"]
             if cand is not None:
                 text = cand
-        return text, in_tok, out_tok
+        return text, in_tok, out_tok, cached
 
     async def complete(self, *, model: str, system: str, user: str,
                        cwd: str | None = None,
-                       params: dict | None = None) -> LLMResult:
+                       params: dict | None = None,
+                       session: str | None = None,
+                       effort: str | None = None,
+                       allowed_tools: str | None = None,
+                       mcp_config: str | None = None) -> LLMResult:
+        # `session` is accepted for signature parity and ignored: `codex exec` is
+        # one-shot, and session_active() correctly reports False, so callers
+        # always send the full self-contained payload on this provider.
+        # `effort` likewise: `codex exec` has no verified equivalent flag, so a
+        # level configured for the claude_cli tier is inapplicable here rather
+        # than mistranslated into a setting we have not checked. Flipping
+        # smart_provider to codex_cli therefore drops effort control, by design.
         # `params` (sampling overrides) is accepted for signature parity and
         # ignored: `codex exec` has no convenient temperature flag, and the spec
         # is explicit about not forcing one on the CLI tier.
@@ -169,7 +184,7 @@ class CodexCliProvider(LLMProvider):
             raise OrchestratorError(
                 f"codex CLI exited {proc.returncode}: {combined.strip()[:1000]}")
 
-        text, in_tok, out_tok = self._parse_events(out)
+        text, in_tok, out_tok, cached = self._parse_events(out)
         # --output-last-message is the most reliable source of the final text.
         file_text = _read_and_unlink(last_msg_path)
         if file_text:
@@ -181,8 +196,13 @@ class CodexCliProvider(LLMProvider):
         if self.pcfg.get("auth", "subscription") == "api":
             cost = self._priced(model, in_tok, out_tok)
 
+        # Codex reports `input_tokens` as the TOTAL prompt (cached bytes included),
+        # unlike the Anthropic shape — so hit is the reported cached count and miss
+        # is the remainder, preserving hit + miss == input_tokens.
+        hit = min(cached, in_tok)
         return LLMResult(text=text, input_tokens=in_tok, output_tokens=out_tok,
-                         cost_usd=cost, model=model, raw=out)
+                         cost_usd=cost, model=model, raw=out,
+                         cache_hit_tokens=hit, cache_miss_tokens=max(in_tok - hit, 0))
 
     def _priced(self, model: str, in_tok: int, out_tok: int) -> float:
         for wm in (self.cfg.get("worker_models") or {}).keys():
@@ -191,6 +211,20 @@ class CodexCliProvider(LLMProvider):
                 return (in_tok / 1e6 * float(entry.get("input_per_mtok", 0))
                         + out_tok / 1e6 * float(entry.get("output_per_mtok", 0)))
         return 0.0
+
+
+def _cached_input_tokens(usage: dict) -> int:
+    """Cached-prefix input tokens from a codex `usage` object, tolerating the
+    shapes seen across releases (flat `cached_input_tokens`, the Anthropic-style
+    `cache_read_input_tokens`, or OpenAI's nested
+    `input_tokens_details.cached_tokens`). 0 when the release reports none."""
+    for key in ("cached_input_tokens", "cache_read_input_tokens"):
+        if usage.get(key) is not None:
+            return int(usage[key] or 0)
+    details = usage.get("input_tokens_details") or usage.get("prompt_tokens_details")
+    if isinstance(details, dict):
+        return int(details.get("cached_tokens") or 0)
+    return 0
 
 
 def _safe_unlink(path: str) -> None:

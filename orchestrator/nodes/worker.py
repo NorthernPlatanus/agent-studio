@@ -153,13 +153,22 @@ async def run_candidate(ctx: RunContext, payload: dict) -> dict:
                        "diff": "", "gate_log": "", "error": "", "notes": "",
                        "messages": messages}
     try:
+        # Fail closed BEFORE spending a call. persist_specs rejects a spec with no
+        # files_write at plan time, but specs planned before that check exist in
+        # the store; without an allowlist apply_response would let this candidate
+        # write anywhere in the worktree.
+        if not spec.get("files_write"):
+            raise PatchError(
+                f"spec {task_id} declares no files_write — refusing to run a worker "
+                f"with no write allowlist. Re-plan the task "
+                f"(`plan --tasks {task_id}`) so it lists the files it may write.")
         # Worktree: fresh on attempt 1, reused (with prior commits) on retries.
         if attempt == 1:
-            worktree = await asyncio.to_thread(ctx.git.create_worktree, wt_name)
+            worktree = await ctx.git.acreate_worktree(wt_name)
         else:
             worktree = ctx.git.work_dir / wt_name
             if not worktree.exists():
-                worktree = await asyncio.to_thread(ctx.git.create_worktree, wt_name)
+                worktree = await ctx.git.acreate_worktree(wt_name)
         cand["worktree"] = str(worktree)
         cand["branch"] = ctx.git.wt_branch(wt_name)
         await asyncio.to_thread(ensure_deps, worktree, ctx.cfg)
@@ -201,9 +210,16 @@ async def run_candidate(ctx: RunContext, payload: dict) -> dict:
         # tools at the candidate worktree, not the orchestrator repo.
         cwd = str(worktree)
         while True:
+            # Pre-flight: refuse the call if its estimated cost would blow a cap,
+            # rather than discovering that after paying for it (ops/budget).
+            ctx.budget.estimate_and_check(
+                task_id=task_id, provider=provider_name,
+                provider_type=provider.type, model=model,
+                prompt_chars=len(system) + sum(len(m["content"]) for m in messages),
+                max_output_tokens=(params or {}).get("max_tokens"))
             result = await provider.complete_chat(
                 model=model, system=system, messages=messages, cwd=cwd,
-                params=params)
+                params=params, effort=ctx.worker_effort(cand_id))
             messages.append({"role": "assistant", "content": result.text})
             ctx.budget.record(
                 task_id=task_id, role=f"worker:{cand_id}", provider=provider_name,
@@ -253,8 +269,8 @@ async def run_candidate(ctx: RunContext, payload: dict) -> dict:
         cand["notes"] = parsed.plan[:2000]
         written = await asyncio.to_thread(
             apply_response, worktree, parsed, spec.get("files_write"))
-        await asyncio.to_thread(
-            ctx.git.commit_all, worktree,
+        await ctx.git.acommit_all(
+            worktree,
             f"wip({task_id}): {cand_id} attempt {attempt}\n\nRefs {task_id}")
         log.info("%s/%s attempt %d: applied %s", task_id, cand_id, attempt, written)
 

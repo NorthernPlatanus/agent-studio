@@ -26,8 +26,11 @@ class _Cliish(LLMProvider):
         super().__init__("p", None, None)
         self.seen = None
 
-    async def complete(self, *, model, system, user, cwd=None, params=None):
-        self.seen = {"system": system, "user": user, "cwd": cwd, "params": params}
+    async def complete(self, *, model, system, user, cwd=None, params=None,
+                       session=None, effort=None,
+                       allowed_tools=None, mcp_config=None):
+        self.seen = {"system": system, "user": user, "cwd": cwd, "params": params,
+                     "session": session}
         return LLMResult(text="ok")
 
 
@@ -240,3 +243,40 @@ def test_usage_migration_on_preexisting_db(tmp_path):
         "SELECT SUM(cache_hit_tokens) h FROM usage").fetchone()
     assert row["h"] == 16
     store.close()
+
+
+# ---- one retry ceiling for both routers (item 7) -----------------------------
+
+def test_retry_ceiling_follows_the_ladder():
+    from orchestrator.engine.graph import retry_ceiling
+    on = Config({"run": {"escalate_on_exhaustion": True, "max_fix_rounds": 4,
+                         "max_retries": 3}}, "p", Path("/tmp"))
+    off = Config({"run": {"escalate_on_exhaustion": False, "max_fix_rounds": 4,
+                          "max_retries": 3}}, "p", Path("/tmp"))
+    assert retry_ceiling(on) == 4      # ladder on -> the fix-depth bound
+    assert retry_ceiling(off) == 3     # ladder off -> legacy max_retries
+
+
+def test_review_revise_uses_the_same_ceiling_as_the_gate_path():
+    """Regression: `route_after_review` bounded a revise by max_retries while the
+    gate path used max_fix_rounds, so with the shipped defaults (3 vs 4) a
+    review-driven revise gave up an attempt early and never reached the senior."""
+    from orchestrator.engine.graph import decide_after_review
+    cfg = Config({"run": {"escalate_on_exhaustion": True, "max_fix_rounds": 4,
+                          "max_retries": 3, "n_candidates": 1},
+                  "roles": {"worker": {"default": "w", "candidates": ["w"]}},
+                  "gate": {"log_tail_chars": 500}}, "p", Path("/tmp"))
+    revise = {"verdict": {"decision": "revise", "winner": "w"}, "attempt": 3}
+    assert decide_after_review(cfg, revise) == "dispatch"     # was "finalize"
+    # ...and both routers agree on where the ceiling actually is
+    assert decide_after_review(cfg, {**revise, "attempt": 4}) == "finalize"
+    assert decide_after_collect(cfg, _red(3)) == "dispatch"
+
+
+def test_review_approve_and_reject_are_unaffected():
+    from orchestrator.engine.graph import decide_after_review
+    cfg = Config({"run": {"max_retries": 3}}, "p", Path("/tmp"))
+    assert decide_after_review(cfg, {"verdict": {"decision": "approve"},
+                                     "attempt": 9}) == "integrate"
+    assert decide_after_review(cfg, {"verdict": {"decision": "reject"},
+                                     "attempt": 1}) == "finalize"

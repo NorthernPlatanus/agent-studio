@@ -16,7 +16,7 @@ import re
 from ..ops.backlog import make_backlog
 from ..ops import projectmap
 from ..core.context import RunContext
-from ..core.errors import PlannerNeedsInput
+from ..core.errors import PlannerNeedsInput, SessionLost
 from ..providers import get_provider
 
 log = logging.getLogger("orchestrator.planner")
@@ -72,17 +72,9 @@ def _backlog_excerpt(ctx: RunContext, only_ids: list[str] | None) -> str:
     return text
 
 
-async def plan_or_ask(ctx: RunContext, *, discussion: str = "", transcript: str = "",
-                      only_ids: list[str] | None = None) -> dict:
-    """One planner turn. Returns the normalized envelope
-    {questions, assumptions, specs} WITHOUT persisting — so `discuss` can loop
-    and `plan` can decide what to do with questions. `transcript` carries the
-    running multi-turn conversation (the CLI planner is single-turn, so we pass
-    history in the prompt rather than via complete_chat)."""
-    provider_name, model = ctx.role_target("planner")
-    provider = get_provider(ctx.cfg, provider_name)
-    system = ctx.cfg.prompt("planner")
-
+def _full_prompt(ctx: RunContext, *, discussion: str, transcript: str,
+                 only_ids: list[str] | None) -> str:
+    """The complete, self-contained planner payload."""
     existing = list(ctx.store.all_tasks())
     parts = ["# BACKLOG (source of truth)",
              _backlog_excerpt(ctx, only_ids), ""]
@@ -103,24 +95,101 @@ async def plan_or_ask(ctx: RunContext, *, discussion: str = "", transcript: str 
     if proto:
         parts += [f"The repo protocol is in {proto} — read it with your tools "
                   f"before finalizing specs."]
+    return "\n".join(parts)
 
-    result = await provider.complete(model=model, system=system,
-                                     user="\n".join(parts),
-                                     cwd=str(ctx.cfg.repo_path()))
+
+def session_reuse_enabled(cfg) -> bool:
+    return bool(cfg.run.get("session_reuse", False))
+
+
+async def plan_or_ask(ctx: RunContext, *, discussion: str = "", transcript: str = "",
+                      only_ids: list[str] | None = None,
+                      session: str | None = None, delta: str = "") -> dict:
+    """One planner turn. Returns the normalized envelope
+    {questions, assumptions, specs} WITHOUT persisting — so `discuss` can loop
+    and `plan` can decide what to do with questions. `transcript` carries the
+    running multi-turn conversation (the CLI planner is single-turn, so we pass
+    history in the prompt rather than via complete_chat).
+
+    `session` + `delta` are the continuity path (run.session_reuse). The `discuss`
+    loop otherwise re-sends backlog + project map + every current spec on EVERY
+    turn — tens of thousands of tokens of unchanged context, re-read at full
+    weight, against the subscription tier that is the binding constraint. When
+    the provider reports the session is live, only `delta` (the human's new
+    answer) is sent and the conversation supplies the rest. If the resume fails,
+    SessionLost brings us back here and the full payload goes out once."""
+    provider_name, model = ctx.role_target("planner")
+    provider = get_provider(ctx.cfg, provider_name)
+    system = ctx.cfg.prompt("planner")
+
+    use_session = session if session_reuse_enabled(ctx.cfg) else None
+    continuing = bool(use_session and delta and provider.session_active(use_session))
+    user = (f"# HUMAN REPLY — continue the plan from our conversation\n{delta}"
+            if continuing else
+            _full_prompt(ctx, discussion=discussion, transcript=transcript,
+                         only_ids=only_ids))
+
+    effort = ctx.role_effort("planner")
+    try:
+        result = await provider.complete(model=model, system=system, user=user,
+                                         cwd=str(ctx.cfg.repo_path()),
+                                         session=use_session, effort=effort)
+    except SessionLost:
+        # The abbreviated payload has no context without the session — resend it
+        # whole exactly once (the provider already dropped the dead session id,
+        # so this call opens a fresh one to continue from).
+        log.warning("planner session lost; resending the full payload")
+        result = await provider.complete(
+            model=model, system=system,
+            user=_full_prompt(ctx, discussion=discussion, transcript=transcript,
+                              only_ids=only_ids),
+            cwd=str(ctx.cfg.repo_path()), session=use_session, effort=effort)
+
     ctx.budget.record(
         task_id=None, role="planner", provider=provider_name,
         provider_type=provider.type, model=model,
         input_tokens=result.input_tokens, output_tokens=result.output_tokens,
-        cost_usd=result.cost_usd)
+        cost_usd=result.cost_usd, cache_hit_tokens=result.cache_hit_tokens,
+        cache_miss_tokens=result.cache_miss_tokens)
     return parse_planner_output(result.text)
+
+
+def validate_spec(spec: dict) -> None:
+    """Reject a spec the executor cannot run, at PLAN time, with a message the
+    planner can act on. Raises ValueError.
+
+    `files_write` is the worker's entire write allowlist (ops/patch), and both of
+    its degenerate forms are silently bad much later:
+      * key absent  -> apply_response gets None -> NO allowlist; the worker may
+        write any path in the worktree, defeating the containment the spec exists
+        to express.
+      * empty list  -> every write is rejected, so the task can never go green;
+        it burns the full retry ladder (and the scheduler runs it alone in a
+        batch of one) before failing for a reason no log makes obvious.
+    Human-only specs (`agent_able: false`) never reach a worker, so they are
+    exempt."""
+    for key in ("id", "title", "description"):
+        if not spec.get(key):
+            raise ValueError(f"Planner spec missing '{key}': {spec}")
+    if not spec.get("agent_able", True):
+        return
+    files_write = spec.get("files_write")
+    if files_write is None:
+        raise ValueError(
+            f"Planner spec {spec['id']} has no 'files_write': an agent_able task "
+            f"must declare the exact files it may write (that list IS the worker's "
+            f"write allowlist). Add files_write, or set agent_able: false.")
+    if not isinstance(files_write, list) or not files_write:
+        raise ValueError(
+            f"Planner spec {spec['id']} has an empty/invalid 'files_write' "
+            f"({files_write!r}): with nothing writable the task can never pass its "
+            f"gate. List the files to change, or set agent_able: false.")
 
 
 def persist_specs(ctx: RunContext, specs: list[dict], note: str = "") -> list[dict]:
     """Validate + upsert planner specs. Shared by `plan` and `discuss`."""
     for spec in specs:
-        for key in ("id", "title", "description"):
-            if not spec.get(key):
-                raise ValueError(f"Planner spec missing '{key}': {spec}")
+        validate_spec(spec)
         # The planner sees current specs (which carry queue status) and may
         # echo the field back — never let LLM output overwrite queue state.
         spec.pop("status", None)

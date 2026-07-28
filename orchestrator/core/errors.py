@@ -27,6 +27,16 @@ class PatchError(OrchestratorError):
     files_write, etc.). Counts as a worker failure -> retry with the error."""
 
 
+class SessionLost(OrchestratorError):
+    """A CLI provider could not resume the session it was asked to continue.
+
+    Callers that sent an abbreviated payload (relying on the session to carry the
+    context) MUST catch this and retry once with the full self-contained prompt —
+    the provider has already dropped the dead session id, so the retry starts a
+    fresh one. Never let this reach a task as a plain failure: the request was
+    fine, only the continuation was lost."""
+
+
 class PlannerNeedsInput(OrchestratorError):
     """The tech-lead planner returned clarifying questions instead of specs.
     One-shot `plan` prints these and exits non-zero; `discuss` handles them

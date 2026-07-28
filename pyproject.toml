@@ -25,3 +25,11 @@ include = ["orchestrator*"]
 [tool.pytest.ini_options]
 asyncio_mode = "auto"
 testpaths = ["tests"]
+# Several test modules share fixtures via `from tests.test_worker_loop import ...`.
+# There is no tests/__init__.py, so pytest puts `tests/` (not the root) on
+# sys.path and that import fails — bare `pytest` could not even collect, only
+# `python -m pytest` worked, because it happens to prepend the cwd.
+pythonpath = ["."]
+markers = [
+    "slow: shells out to real git/subprocesses; deselect with -m 'not slow'",
+]

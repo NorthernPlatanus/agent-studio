@@ -2,7 +2,11 @@
 
 import textwrap
 
-from orchestrator.core.config import Config, load_config
+from pathlib import Path
+
+import pytest
+
+from orchestrator.core.config import Config, _apply_env, load_config
 
 
 def _cfg(root, data, project="proj"):
@@ -116,3 +120,50 @@ def test_missing_profile_raises(tmp_path):
         assert "nope" in str(e)
     else:
         raise AssertionError("expected FileNotFoundError")
+
+
+# ---- env overrides reach underscored sections (item 16) ----------------------
+
+def _data():
+    return {"run": {"n_candidates": 1, "max_retries": 3},
+            "visual_gate": {"enabled": False, "run_cmd": None},
+            "worker_output": {"full_file_max_lines": 400},
+            "roles": {"smart_provider": "claude_cli"}}
+
+
+def test_env_override_simple_section(monkeypatch):
+    monkeypatch.setenv("ORCH_RUN_N_CANDIDATES", "3")
+    assert _apply_env(_data())["run"]["n_candidates"] == 3
+
+
+def test_env_override_reaches_underscored_section(monkeypatch):
+    # Splitting on the FIRST underscore looked for a section named "visual".
+    monkeypatch.setenv("ORCH_VISUAL_GATE_ENABLED", "true")
+    monkeypatch.setenv("ORCH_WORKER_OUTPUT_FULL_FILE_MAX_LINES", "120")
+    out = _apply_env(_data())
+    assert out["visual_gate"]["enabled"] is True
+    assert out["worker_output"]["full_file_max_lines"] == 120
+
+
+def test_env_override_prefers_the_longest_matching_section(monkeypatch):
+    # Both "worker_output" and a hypothetical "worker" exist; the longer wins.
+    data = _data()
+    data["worker"] = {"output": "nope"}
+    monkeypatch.setenv("ORCH_WORKER_OUTPUT_FULL_FILE_MAX_LINES", "77")
+    out = _apply_env(data)
+    assert out["worker_output"]["full_file_max_lines"] == 77
+    assert out["worker"]["output"] == "nope"
+
+
+def test_env_override_unknown_section_is_ignored(monkeypatch):
+    monkeypatch.setenv("ORCH_NOPE_WHATEVER", "1")
+    monkeypatch.setenv("ORCH_RUN", "1")          # no key half at all
+    assert _apply_env(_data()) == _data()
+
+
+def test_repo_path_error_names_the_current_layout_first():
+    cfg = Config({"project": {"repo_path": None}}, "proj", Path("/tmp"))
+    with pytest.raises(ValueError) as e:
+        cfg.repo_path()
+    msg = str(e.value)
+    assert msg.index("projects/<name>/profile.yaml") < msg.index("config/projects")

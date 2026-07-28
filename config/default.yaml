@@ -34,6 +34,14 @@ providers:
     binary: claude
     allowed_tools: "Read,Grep,Glob"   # read-only: planner/reviewer inspect, never edit
     timeout_s: 600
+    # TIER-WIDE fallback reasoning effort: low | medium | high | xhigh | max.
+    # null leaves the CLI's own default alone. Per-role keys win over this —
+    # roles.planner.effort, roles.reviewer.effort, run.escalate_effort — because
+    # the roles aren't equally hard (the planner's mistakes propagate into every
+    # downstream attempt; the reviewer grades against criteria already written).
+    # Higher effort spends more subscription tokens per call, the binding
+    # constraint, so it shows up directly in `orchestrator metrics`.
+    effort: null
   # Codex smart-tier alternative. Defined here (not commented) so that flipping
   # roles.smart_provider to codex_cli is a genuine one-line switch. `codex exec`
   # defaults to a read-only sandbox — planner/reviewer never edit the repo.
@@ -58,14 +66,40 @@ roles:
   smart_provider: claude_cli        # claude_cli | codex_cli
   # provider: null => inherit smart_provider. An explicit provider still wins
   # (back-compat with profiles that hard-code provider: claude_cli).
-  planner:  {provider: null, model: opus}
-  reviewer: {provider: null, model: opus}
+  # `effort` (low|medium|high|xhigh|max) is per-role and overrides the tier-wide
+  # providers.<name>.effort. Only reasoning-capable providers use it; codex_cli
+  # and openai_compatible ignore it.
+  planner:  {provider: null, model: opus, effort: null}
+  reviewer: {provider: null, model: opus, effort: null}
+  # The visual verifier (see `verify:` below). `allowed_tools` is per-role on
+  # purpose: this is the ONLY role that gets the inspector's MCP tools, and the
+  # provider-wide allowlist cannot express "one role only". Tool names follow
+  # mcp__<mcp_server>__<tool>; keep Read/Grep/Glob so it can also read the code.
+  #
+  # ►► LIST READ-ONLY INSPECTOR TOOLS ONLY. ◄◄
+  # The reference inspector ships 60 tools, 24 of which mutate or execute:
+  # every `set_*`, `add_helper`/`remove_helper`, `toggle_*`, `highlight_object`,
+  # `click_inspect`, `overlay_selected`, `dispose_check`, `set_dev_port/url`, and
+  # `run_js` (arbitrary JavaScript in the page). A verifier holding those could
+  # change the live scene until it matched the acceptance criteria and then pass
+  # it — verifying its own edit instead of the candidate's code, which is exactly
+  # the failure this phase exists to prevent. `run_js` additionally makes the
+  # allowlist meaningless, since anything excluded can be done through it.
+  verifier:
+    provider: null
+    model: opus
+    effort: null
+    allowed_tools: null
   worker:
     default: null                  # REQUIRED per project (key into worker_models)
     candidates: []                 # pool for best-of-N
 
 run:
   n_candidates: 1        # best-of-N diversity knob (the planner may raise it per task)
+  # max_retries and max_fix_rounds INTERACT: with escalate_on_exhaustion on,
+  # max_fix_rounds is the attempt ceiling for every retry path (gate failure and
+  # review `revise` alike) and max_retries is ignored; with it off, max_retries
+  # is the ceiling. See engine/graph.retry_ceiling — one function, both routers.
   max_retries: 3         # gate/review failure -> worker retry, at most this many
   max_parallel_tasks: 3  # scheduler batch width (files_write-disjoint tasks only)
   # Warm review->fix depth on the cheap Rung-1 worker before escalation. Distinct
@@ -79,6 +113,22 @@ run:
   escalate_target: smart_provider   # the claude_cli/codex_cli subscription tier
   escalate_model: opus              # senior id — MUST co-vary with smart_provider
                                     # (opus/sonnet under claude_cli; a gpt-5.6-* id under codex_cli)
+  escalate_effort: null             # senior's reasoning effort; falls back to
+                                    # providers.<smart_provider>.effort when null
+  # Routing on the planner's own `risk` / `complexity` labels. Both OFF by
+  # default: they trade verification (or cheap-tier attempts) for subscription
+  # quota, and which side of that trade you want is a project decision.
+  #
+  # Skip the reviewer entirely for a green, low-risk, single-candidate task and
+  # merge it straight away — saves one smart-tier call on the majority of tasks.
+  # Never applies to `visual: true` specs, and the merge is logged as
+  # `auto_integrated` so "merged without review" is visible in the ledger.
+  auto_integrate_low_risk: false
+  # Send `risk: high` / `complexity: l` specs to the subscription senior on
+  # attempt 1 instead of spending max_fix_rounds cheap attempts (and a gate run
+  # each) first. Requires escalate_on_exhaustion (the senior is its target); the
+  # task still gets the normal retry ladder, it just starts at the top of it.
+  senior_first_for_high_risk: false
   need_files_rounds: 2   # legacy alias for retrieval_rounds (kept for back-compat)
   need_files_max_bytes: 65536
   # Bounded read-only retrieval loop (Phase 2): a worker may emit <grep>/<read>/
@@ -90,6 +140,15 @@ run:
   retrieval_snippet_lines: 4  # snippet size per grep match
   on_limit_exhausted: pause   # pause (checkpoint & stop) | degrade (opus roles -> degrade_model)
   degrade_model: null
+  # Reuse ONE Claude CLI conversation across the turns of a single `discuss` loop
+  # (--session-id then --resume) instead of re-sending backlog + project map +
+  # every current spec on every turn. Scoped per discuss run and closed when the
+  # loop ends, so the planner never inherits an unrelated run's context. A failed
+  # resume falls back to the full payload automatically (SessionLost).
+  # OFF by default: verify it against your installed CLI once, then enable —
+  # `claude -p --resume` behavior is the one thing here we cannot unit-test.
+  # Providers without server-side sessions (codex_cli, openai_compatible) ignore it.
+  session_reuse: false
 
 # The deterministic self-check gate: shell commands run in the candidate
 # worktree, zero tokens. Entirely project-defined.
@@ -100,9 +159,23 @@ gate:
   timeout_s: 1200
   log_tail_chars: 6000   # failure log tail shown to the worker on retry
 
+review:
+  # The reviewer prompts demand a scorecard, so a missing one is a malformed
+  # verdict, not an implicit "no objection": an `approve` with no `scores` is
+  # demoted to `revise` and sent back. Set false ONLY for a reviewer model that
+  # genuinely cannot emit the rubric — it re-opens the auto-approve hole the
+  # rubric was added to close, and it is degrade mode (cheap reviewer, least
+  # likely to score well-formed) where that hole would fire most.
+  require_rubric: true
+
 budget:
   per_task_usd: 1.50
   per_run_usd: 15.00
+  # Output tokens assumed by the PRE-FLIGHT estimate when a candidate sets no
+  # max_tokens. Caps are checked before a call as well as after it, so one large
+  # call can't overshoot by an unbounded amount; the estimate is intentionally
+  # conservative, so this is an upper bound, not a typical response size.
+  assumed_max_output_tokens: 8000
   # Subscription-auth CLI tiers (claude_cli, codex_cli auth:subscription) are
   # logged for visibility but not counted against the cash budget. Set count_cli
   # true to count ALL CLI providers, or per-provider `count: true` in providers.*.
@@ -111,11 +184,12 @@ budget:
 
 worker_output:
   full_file_max_lines: 400  # larger files must be edited via SEARCH/REPLACE
-  # Worker loop style. `blocks` (default): plain-text <grep>/<read>/<file>/<edit>
-  # protocol over complete_chat — works on any chat-completions model and keeps
-  # the provider/budget layer intact. `react`: native tool-calling sub-agent
-  # (optional experiment; requires a usage->budget bridge before use).
-  mode: blocks              # blocks | react
+  # NOTE: there is no `mode:` key. The worker loop is always the plain-text
+  # <grep>/<read>/<file>/<edit> block protocol over complete_chat, which works on
+  # any chat-completions model and keeps the provider/budget layer intact. A
+  # native ReAct tool-calling worker is deferred (PLAN_REVIEW.md P25-2: it
+  # bypasses the budget ledger); a toggle that silently does nothing is worse
+  # than no toggle, so the key is gone rather than documented-but-dead.
 
 prompts:
   # Two-layer resolver: a per-project overlay wins over the shared templates.
@@ -146,18 +220,60 @@ domains: {}
 
 # Optional visual/runtime gate (Phase 6). Green gate => "it runs", not "it's
 # correct": a three.js scene can compile clean and render nothing. This asserts
-# over the scene-graph via a pluggable MCP inspector. OFF by default — the
+# over scene facts printed by a headless dump script. OFF by default — the
 # harness runs fine with enabled:false; only `visual: true` specs are checked.
+# With enabled:true but no facts_cmd, the gate passes through and logs
+# `visual_gate_skipped` (never a silent green).
+# Visual VERDICT (distinct from visual_gate below). The gate checks assertions you
+# wrote; this asks an agent with a live scene inspector "is anything wrong here
+# that nobody thought to assert?" — the question a rendering change actually turns
+# on. Runs ONCE per task, on the winning candidate, after an approving review and
+# before integrate, and only for `visual: true` specs.
+#
+# It is SERIALIZED (RunContext.inspector_lock): the dev server and inspector
+# bridge are bound to fixed ports, so two concurrent verifications would inspect
+# each other's app. Everything before this phase stays parallel.
+#
+# COST: the reference inspector exposes ~60 tools whose schemas are re-sent every
+# turn — a measured trivial two-tool query cost ~77k input tokens vs ~13k for a
+# plain call. Once per task, not per attempt, is what makes it affordable. Off by
+# default for that reason.
+verify:
+  enabled: false
+  # Command that starts the candidate's app IN ITS OWN WORKTREE. `{port}` is
+  # substituted with dev_port. Spawned in its own process group and the whole
+  # group is killed on teardown, so the port is genuinely released.
+  run_cmd: null            # e.g. "npm run dev -- --port {port} --strictPort"
+  ready_probe: null        # e.g. "http://localhost:{port}/" — polled until it answers
+  ready_timeout_s: 60
+  dev_port: 5199           # app port; also handed to the inspector as DEV_PORT
+  bridge_port: 9333        # inspector bridge; it falls back to a free port if taken
+  headless: true           # launches its own browser — no human, no open tab needed
+  # The MCP server is spawned by the CLI from a config this harness GENERATES per
+  # call (the dev port is a runtime fact, so it can't be hand-maintained).
+  mcp_server: threejs      # name; tools are exposed as mcp__<this>__<tool>
+  mcp_command: npx
+  mcp_args: ["-y", "threejs-devtools-mcp"]
+  mcp_env: {}              # extra env for the server (merged over the defaults)
+
 visual_gate:
   enabled: false
-  inspector: threejs           # key into `mcp:`; later: unity | blender
   run_cmd: null                # e.g. "npm run dev" — foreground; supervised + process-group-killed
-  ready_probe: null            # e.g. "http://localhost:5173"
+  ready_probe: null            # e.g. "http://localhost:5173" — polled until the app
+                               # started by run_cmd answers. Ignored without run_cmd
+                               # (there would be nothing to wait for).
+  ready_timeout_s: 60
+  # THE fact source: a command run in the candidate worktree that prints a JSON
+  # object of scene facts on stdout and exits 0. Examples:
+  #   node scripts/dump_scene.mjs               (three.js / R3F headless walk)
+  #   blender --background --python dump.py     (Blender)
+  # A non-zero exit, non-JSON output, or a timeout FAILS the candidate.
+  facts_cmd: null
+  facts_timeout_s: 120
   assertions: []               # restricted expressions over scene facts, e.g.
                                #   - "scene.visibleMeshCount > 0"
                                #   - "any(l.intensity > 0 for l in lights)"
                                #   - "camera.seesSceneBounds"
-  screenshot_fallback: false   # last resort (pixel-diff vs reference); expensive/flaky, off
 
 # Extra MCP servers for claude_cli roles (reviewer/planner), e.g. a live
 # devtools/inspector bridge for whatever app you're orchestrating.

@@ -21,6 +21,7 @@ import json
 import logging
 
 from ..core.context import RunContext
+from ..providers import get_provider
 from .planner import persist_specs, plan_or_ask
 
 log = logging.getLogger("orchestrator.discuss")
@@ -58,8 +59,17 @@ async def run_discuss(ctx: RunContext, initial: str, *,
         turns.append(("system", f"(resumed session)\n{prior}"))
     turns.append(("user", initial))
 
+    # Provider-side continuity key for this loop (honored only when
+    # run.session_reuse is on and the provider supports it). Scoped to one
+    # discuss run: the planner may see the whole conversation, but never another
+    # run's. `delta` is the newest human turn — the only genuinely new text on
+    # turn 2+, since backlog/map/specs are unchanged and already in the session.
+    llm_session = f"discuss:{ctx.run_id}"
+    delta = ""
+
     while True:
-        env = await plan_or_ask(ctx, transcript=_format(turns))
+        env = await plan_or_ask(ctx, transcript=_format(turns),
+                                session=llm_session, delta=delta)
         ctx.store.save_discussion(session, _format(turns))
 
         if env["questions"]:
@@ -71,6 +81,7 @@ async def run_discuss(ctx: RunContext, initial: str, *,
             answer = read("your answer> ")
             turns.append(("planner", json.dumps(env)))
             turns.append(("user", answer))
+            delta = answer
             continue
 
         specs = env["specs"]
@@ -80,11 +91,24 @@ async def run_discuss(ctx: RunContext, initial: str, *,
             persist_specs(ctx, specs, note="discuss")
             ctx.store.save_discussion(session, _format(turns) + "\nAPPLIED")
             write(f"applied {len(specs)} spec(s).")
+            _end_session(ctx, llm_session)
             return specs
         if choice in ("abort", "a", "n", "no"):
             write("aborted — nothing applied.")
+            _end_session(ctx, llm_session)
             return []
         # edit: capture a free-text note as the next turn
         note = read("edit note> ")
         turns.append(("planner", json.dumps(env)))
         turns.append(("user", f"EDIT: {note}"))
+        delta = f"EDIT: {note}"
+
+
+def _end_session(ctx: RunContext, key: str) -> None:
+    """Close the provider-side conversation when the loop ends, so the next
+    discuss starts clean rather than inheriting this one's context."""
+    try:
+        provider_name, _ = ctx.role_target("planner")
+        get_provider(ctx.cfg, provider_name).end_session(key)
+    except Exception as e:      # never let cleanup break a completed discuss
+        log.debug("could not end planner session %s: %s", key, e)

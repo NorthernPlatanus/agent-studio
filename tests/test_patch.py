@@ -68,3 +68,49 @@ def test_apply_rejects_missing_search(tmp_path):
         '<edit path="d.ts">\n<<<<<<< SEARCH\nabsent\n=======\nx\n>>>>>>> REPLACE\n</edit>')
     with pytest.raises(PatchError, match="not found"):
         apply_response(tmp_path, parsed, None)
+
+
+def test_apply_rejects_symlink_escape(tmp_path):
+    """A symlinked directory inside the worktree defeats the lexical relative /
+    '..' checks: `link/pwned.txt` is a perfectly clean relative path that
+    resolves outside the tree."""
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    root = tmp_path / "wt"
+    root.mkdir()
+    (root / "link").symlink_to(outside, target_is_directory=True)
+
+    parsed = parse_worker_response('<file path="link/pwned.txt">\nx\n</file>')
+    with pytest.raises(PatchError, match="escapes the worktree"):
+        apply_response(root, parsed, ["link/pwned.txt"])   # even when allowlisted
+    assert not (outside / "pwned.txt").exists()            # nothing written
+
+
+def test_symlink_escape_is_rejected_before_any_write(tmp_path):
+    """The escaping path must not take a legitimate sibling write with it into a
+    half-applied state — nothing is written when any path is rejected."""
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    root = tmp_path / "wt"
+    root.mkdir()
+    (root / "link").symlink_to(outside, target_is_directory=True)
+
+    parsed = parse_worker_response(
+        '<file path="ok.txt">\nfine\n</file>\n'
+        '<file path="link/pwned.txt">\nx\n</file>')
+    with pytest.raises(PatchError):
+        apply_response(root, parsed, ["ok.txt", "link/pwned.txt"])
+    assert not (outside / "pwned.txt").exists()
+    assert not (root / "ok.txt").exists()
+
+
+def test_symlinked_file_inside_root_still_allowed(tmp_path):
+    """A symlink that stays inside the worktree is not an escape — only the
+    resolved location matters, so ordinary in-tree links keep working."""
+    root = tmp_path / "wt"
+    (root / "real").mkdir(parents=True)
+    (root / "alias").symlink_to(root / "real", target_is_directory=True)
+    parsed = parse_worker_response('<file path="alias/a.txt">\nhi\n</file>')
+    written = apply_response(root, parsed, ["alias/a.txt"])
+    assert written == ["real/a.txt"]                       # reported resolved
+    assert (root / "real/a.txt").read_text() == "hi\n"

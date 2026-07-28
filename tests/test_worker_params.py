@@ -34,12 +34,14 @@ class RecordingProvider:
         self.text = text
         self.calls: list[dict] = []
 
-    async def complete(self, *, model, system, user, cwd=None, params=None):
+    async def complete(self, *, model, system, user, cwd=None, params=None,
+                       session=None, effort=None):
         self.calls.append({"params": params, "user": user})
         return LLMResult(text=self.text)
 
-    async def complete_chat(self, *, model, system, messages, cwd=None, params=None):
-        self.calls.append({"params": params,
+    async def complete_chat(self, *, model, system, messages, cwd=None,
+                            params=None, session=None, effort=None):
+        self.calls.append({"params": params, "effort": effort,
                            "messages": [dict(m) for m in messages]})
         return LLMResult(text=self.text)
 
@@ -96,6 +98,25 @@ async def test_senior_has_no_params_or_approach(tmp_path, monkeypatch):
     assert cand["status"] == "gate_passed"            # no crash
     assert provider.calls[0]["params"] is None        # senior: no sampling params
     assert "# APPROACH" not in cand["messages"][0]["content"]
+    # The senior is the one candidate that DOES carry an effort level, from
+    # run.escalate_effort (unset in this generic config -> falls through to None).
+    ctx.cfg._data["run"]["escalate_effort"] = "medium"
+    provider2 = RecordingProvider()
+    await _run(ctx, provider2, monkeypatch, "senior", attempt=5, feedback="f")
+    assert provider2.calls[0]["effort"] == "medium"
+
+
+async def test_cheap_worker_is_sent_no_effort(tmp_path, monkeypatch):
+    """A chat-completions worker has no reasoning-effort dial. Even with an
+    effort configured for the smart tier, the cheap candidate must be called
+    with None — otherwise the flag reads as if it applied to both tiers."""
+    wm = {"flash": {"provider": "fake", "model": "m"}}
+    ctx = _ctx(tmp_path, wm, ["flash"])
+    ctx.cfg._data["providers"]["claude_cli"]["effort"] = "high"
+    ctx.cfg._data["run"]["escalate_effort"] = "medium"
+    provider = RecordingProvider()
+    await _run(ctx, provider, monkeypatch, "flash")
+    assert provider.calls[0]["effort"] is None
 
 
 async def test_three_keys_one_model_distinct_candidates(tmp_path, monkeypatch):

@@ -74,6 +74,12 @@ def grep(worktree: Path, pattern: str, *, max_matches: int,
     validated (length cap) and passed as a literal -e argument — never through a
     shell — so the worker cannot inject flags or commands. status ∈
     {ok, empty, pattern_too_long, no_backend}.
+
+    `empty` means "searched, found nothing" and `no_backend` means "could not
+    search". Keeping those apart matters: a worker told `empty` concludes the
+    symbol does not exist and plans around that, so a backend failure reported as
+    `empty` is a lie that costs an attempt. Both backends distinguish the two by
+    exit code (0 = matches, 1 = none, >1 = real error), so we do too.
     """
     if len(pattern) > MAX_PATTERN_LEN:
         return [], "pattern_too_long"
@@ -83,16 +89,26 @@ def grep(worktree: Path, pattern: str, *, max_matches: int,
         args = [rg, "--line-number", "--no-heading", "--color", "never",
                 "-e", pattern, "."]
     else:
-        # Fallback: git grep (also read-only, args built by us).
+        # Fallback: git grep (also read-only, args built by us). `rg` is often
+        # absent — note a shell function/alias does NOT satisfy shutil.which — so
+        # this path is load-bearing, not theoretical.
         git = shutil.which("git")
         if not git:
             return [], "no_backend"
-        args = [git, "grep", "-n", "--no-color", "-e", pattern]
+        # --untracked: git grep defaults to TRACKED files only, which would hide
+        # the files the worker itself just wrote in this attempt (nothing is
+        # committed until after the patch applies). Ignored paths stay excluded,
+        # so node_modules/ and build output don't drown the results.
+        args = [git, "grep", "-n", "--no-color", "--untracked", "-e", pattern]
 
     try:
         proc = subprocess.run(args, cwd=str(worktree), capture_output=True,
                               text=True, timeout=_GREP_TIMEOUT_S)
     except (subprocess.TimeoutExpired, OSError):
+        return [], "no_backend"
+    if proc.returncode > 1:
+        # Not "no matches" (that is exit 1) — the backend itself failed: git grep
+        # outside a repo, an unreadable tree, a bad regex. Say so.
         return [], "no_backend"
 
     lines = [ln for ln in proc.stdout.splitlines() if ln.strip()]

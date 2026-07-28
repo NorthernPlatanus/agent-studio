@@ -30,7 +30,7 @@
 rules workers must follow (language, style, test framework, no new deps, ...)>
 
 ## Visual gate (if used)
-- inspector: <threejs | unity | blender>
+- facts_cmd: <headless script that prints scene facts as JSON on stdout, exit 0>
 - run_cmd / ready_probe: <how the app is started + when it's ready>
 - assertions: <the scene-graph checks that define "actually renders">
 
