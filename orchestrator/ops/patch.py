@@ -88,7 +88,15 @@ def _safe_path(root: Path, rel: str, allowed: set[str] | None) -> Path:
         raise PatchError(f"Unsafe path: {rel}")
     if allowed is not None and rel not in allowed:
         raise PatchError(f"Path not in files_write allowlist: {rel}")
-    return (root / p).resolve()
+    resolved = (root / p).resolve()
+    # The lexical checks above are not sufficient: `resolve()` follows symlinks,
+    # so a symlinked directory anywhere in the worktree (`link -> /tmp/x`) turns
+    # the perfectly relative, ..-free `link/pwned.txt` into a write outside the
+    # tree. Compare the RESOLVED path against the resolved root — the worktree is
+    # the sandbox boundary, and it holds whatever the repo happens to contain.
+    if not resolved.is_relative_to(root.resolve()):
+        raise PatchError(f"Path escapes the worktree (symlink?): {rel}")
+    return resolved
 
 
 def apply_response(root: Path, parsed: ParsedResponse,
@@ -121,11 +129,23 @@ def apply_response(root: Path, parsed: ParsedResponse,
             text = text.replace(search, replace, 1)
         pending[target] = text
 
-    written = []
+    # Compute every relative path BEFORE the first write: `relative_to` raising
+    # after a write leaves the file on disk and the bare ValueError escapes as an
+    # unhandled crash (it is not an OrchestratorError, so the worker's PatchError
+    # handler never sees it). Anything that can fail must fail before we touch
+    # the filesystem, and it must fail as a PatchError.
+    root_resolved = root.resolve()
+    writes: list[tuple[Path, str, str]] = []
     for target, content in pending.items():
+        try:
+            rel = str(target.relative_to(root_resolved))
+        except ValueError as e:
+            raise PatchError(f"Path escapes the worktree: {target}") from e
+        writes.append((target, content, rel))
+
+    for target, content, _rel in writes:
         target.parent.mkdir(parents=True, exist_ok=True)
         if content and not content.endswith("\n"):
             content += "\n"
         target.write_text(content)
-        written.append(str(target.relative_to(root)))
-    return written
+    return [rel for _t, _c, rel in writes]

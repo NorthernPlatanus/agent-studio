@@ -82,6 +82,10 @@ cp .env.example .env      # add your COMETAPI_KEY
 claude --version
 ```
 
+`.venv/` is gitignored and its interpreter is a symlink to the machine that
+created it, so a cloned checkout that appears to contain one will not run — always
+create a fresh venv as above (`pytest` then passes from a clean install).
+
 Copy `config/projects/example.yaml` to `projects/<yourname>/profile.yaml`
 (the whole `projects/` tree is gitignored — real profiles, prompt overrides,
 and the generated project-map live there and never touch the harness repo).
@@ -118,6 +122,7 @@ python -m orchestrator run --project example --tasks T-120,T-121 --n 3   # best-
 
 # 5. Observe / continue:
 python -m orchestrator status --project example
+python -m orchestrator metrics --project example   # solve rate, escalations, quota/task
 python -m orchestrator resume --project example    # after a limit/budget pause
 ```
 
@@ -166,8 +171,21 @@ logs a `retrieval` / `retrieval_exhausted` signal that the spec was thin.
 whose big prefix — system + protocol + sorted `files_read` — is byte-stable, so
 CometAPI prefix caching bills retries at the cached input rate (~5–6× cheaper).
 Feedback and retrieval results append as later turns; the prefix is never
-mutated. `usage` records `cache_hit_tokens`/`cache_miss_tokens`, visible in
-`status`.
+mutated. The reviewer payload is stable-first for the same reason (spec and
+acceptance ahead of the volatile diffs, candidates in sorted order), so a
+`revise` round re-sends a byte-identical head. `usage` records
+`cache_hit_tokens`/`cache_miss_tokens` for every tier — including the CLI
+providers, where the Anthropic-shaped `usage` splits input across fresh /
+cache-creation / cache-read buckets — and `status` prints both plus a hit rate.
+
+**Session reuse** (opt-in, `run.session_reuse`): a `discuss` loop otherwise
+re-sends backlog + project map + every current spec on every turn. With it on,
+the Claude CLI planner pins one session (`--session-id`) and continues it
+(`--resume`) for the rest of that loop, so later turns send only the human's new
+answer. Scoped per discuss run and closed at the end, so the planner never
+inherits an unrelated run's context; a failed resume falls back to the full
+payload automatically. Off by default — verify `--resume` against your installed
+CLI once, then enable.
 
 **Escalation ladder**: the cheap worker iterates on a warm cache up to
 `run.max_fix_rounds`; if it still can't pass the gate and
@@ -176,16 +194,30 @@ senior** (Opus/Sonnet or GPT-5.6) — cash cost $0. The senior implements throug
 the same patch→gate channel (it never edits the repo directly), routed as a
 `dispatch` branch so `Send` still originates only from the fan-out.
 
+**Risk routing** (opt-in): the planner labels every spec with `risk` and
+`complexity`. `run.auto_integrate_low_risk` merges a green, low-risk,
+single-candidate task without a reviewer call (logged as `auto_integrated`;
+never applied to `visual: true` specs). `run.senior_first_for_high_risk` sends
+`risk: high` / `complexity: l` specs straight to the subscription senior instead
+of spending the cheap ladder first. Both off by default — they trade
+verification or cheap attempts for subscription quota.
+
 **Domains**: the planner tags each spec with a `domain` ("physics", "render",
 "seam", ...). A domain can override the worker pool and inject a domain-specific
 protocol excerpt (`domains:` in the profile). This is a specialization layer;
 the scheduler still enforces files_write-disjointness regardless of domain.
 
 **Visual gate** (optional, `visual_gate.enabled`): for `visual: true` specs, a
-green gate isn't enough ("compiles" ≠ "renders"). The gate starts the app in the
-worktree, drives a pluggable MCP inspector for scene-graph facts, and evaluates
-restricted assertions (e.g. `scene.visibleMeshCount > 0`) — no `eval`. A failure
-marks the candidate `visual_failed` and loops it back through the normal retry.
+green gate isn't enough ("compiles" ≠ "renders"). The gate optionally starts the
+app in the worktree (`run_cmd`, polled until `ready_probe` answers), runs
+`facts_cmd` — any headless script that prints a JSON object of scene facts, e.g.
+a three.js scene walk or `blender --background --python dump.py` — and evaluates
+restricted assertions over it (e.g. `scene.visibleMeshCount > 0`) with a
+node-allowlisted AST walker, never `eval`. A failed assertion, a crashed
+inspector, or non-JSON output marks the candidate `visual_failed` and loops it
+back through the normal retry. Enabled with **no** `facts_cmd` configured, the
+gate passes through and logs `visual_gate_skipped` — nothing was asserted, and
+the ledger says so rather than reporting a green visual check.
 
 **Project map**: after each successful merge the integrator regenerates a cheap,
 deterministic structural index (tree + module→symbols) into the gitignored

@@ -5,7 +5,11 @@ Merge order (later wins):
   2. projects/<name>/profile.yaml      — the project profile (--project / ORCH_PROJECT),
      falling back to the legacy config/projects/<name>.yaml when the new path is absent
   3. config/local.yaml                 — personal overrides (gitignored)
-  4. ORCH_<SECTION>_<KEY> env vars     — e.g. ORCH_PROJECT_REPO_PATH, ORCH_RUN_N_CANDIDATES
+  4. ORCH_<SECTION>_<KEY> env vars     — e.g. ORCH_PROJECT_REPO_PATH, ORCH_RUN_N_CANDIDATES,
+     ORCH_VISUAL_GATE_ENABLED. The section may itself contain underscores; it is
+     resolved against the loaded config's real top-level keys (longest match
+     wins). Scalars only, and exactly one level deep — providers.claude_cli.* and
+     other nested values belong in config/local.yaml or the project profile.
 
 Access is attribute-style: cfg.project.repo_path, cfg.gate.commands, ...
 
@@ -73,22 +77,44 @@ def _load_yaml(path: Path) -> dict:
         return yaml.safe_load(f) or {}
 
 
+def _split_section(rest: str, data: dict) -> tuple[str, str] | None:
+    """Split `<section>_<key>` against the config's ACTUAL top-level keys.
+
+    Splitting on the first underscore alone makes every underscored section
+    unreachable — `ORCH_VISUAL_GATE_ENABLED` looks for a section named `visual`.
+    So try successively longer prefixes and keep the longest that names a real
+    dict section: `visual_gate` wins over `visual`, and `worker_output` /
+    `worker_models` resolve to themselves rather than a nonexistent `worker`.
+    Returns (section, key), or None when nothing matches."""
+    parts = rest.split("_")
+    for cut in range(len(parts) - 1, 0, -1):     # longest section prefix first
+        section = "_".join(parts[:cut])
+        if isinstance(data.get(section), dict):
+            return section, "_".join(parts[cut:])
+    return None
+
+
 def _apply_env(data: dict) -> dict:
-    """ORCH_<SECTION>_<KEY>=value overrides data[section][key] (scalars only)."""
+    """ORCH_<SECTION>_<KEY>=value overrides data[section][key] (scalars only).
+
+    Both halves may contain underscores (`ORCH_VISUAL_GATE_ENABLED` ->
+    visual_gate.enabled), resolved against the loaded config's own keys. Only
+    ONE level deep: a nested value like providers.claude_cli.timeout_s is not
+    reachable this way — put those in config/local.yaml or the project profile.
+    """
     for name, raw in os.environ.items():
         if not name.startswith("ORCH_") or name == "ORCH_PROJECT":
             continue
-        parts = name[len("ORCH_"):].lower().split("_", 1)
-        if len(parts) != 2:
+        split = _split_section(name[len("ORCH_"):].lower(), data)
+        if split is None:
             continue
-        section, key = parts
-        if section in data and isinstance(data[section], dict):
-            # Find the matching key (env can't express nested/underscored splits
-            # unambiguously, so match against existing keys).
-            for existing in data[section]:
-                if existing.replace("_", "") == key.replace("_", ""):
-                    data[section][existing] = yaml.safe_load(raw)
-                    break
+        section, key = split
+        # Find the matching key (env can't express underscored splits
+        # unambiguously, so match against existing keys).
+        for existing in data[section]:
+            if existing.replace("_", "") == key.replace("_", ""):
+                data[section][existing] = yaml.safe_load(raw)
+                break
     return data
 
 
@@ -103,8 +129,9 @@ class Config(Section):
         rp = self._data["project"]["repo_path"]
         if not rp:
             raise ValueError(
-                "project.repo_path is not set — create a project profile in "
-                "config/projects/<name>.yaml and pass --project <name>."
+                "project.repo_path is not set — create a project profile at "
+                "projects/<name>/profile.yaml (or the legacy "
+                "config/projects/<name>.yaml) and pass --project <name>."
             )
         return Path(rp).expanduser().resolve()
 

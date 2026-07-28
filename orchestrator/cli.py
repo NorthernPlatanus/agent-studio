@@ -6,6 +6,7 @@ Commands:
   run             execute the queue (--dry-run to plan without spending)
   resume          continue a paused/interrupted run from checkpoints
   status          queue, budgets, and cost breakdown
+  metrics         solve rate, escalation frequency, subscription tokens/task
   import-backlog  register backlog items as stubs (no LLM)
 """
 
@@ -68,9 +69,44 @@ def build_parser() -> argparse.ArgumentParser:
     p = sub.add_parser("status", help="queue + cost report")
     _add_common(p)
 
+    p = sub.add_parser("metrics", help="solve rate, escalation frequency, "
+                                       "subscription tokens per completed task")
+    _add_common(p)
+
     p = sub.add_parser("import-backlog", help="register backlog items as stubs (no LLM)")
     _add_common(p)
     return parser
+
+
+def _print_metrics(store) -> None:
+    """The three numbers that decide the worker-tier question, straight off the
+    telemetry the harness already records. Meaningful after ~20 real tasks."""
+    tasks = store.all_tasks()
+    done = sum(1 for t in tasks if t["status"] == "done")
+
+    print("solve rate by candidate (gate pass/fail):")
+    for row in store.gate_outcomes() or []:
+        total = row["passed"] + row["failed"]
+        when = "attempt 1" if row["first_attempt"] else "retries  "
+        print(f"  {row['cand_id']:<16} {when}  passed={row['passed']:<4} "
+              f"failed={row['failed']:<4} rate={row['passed'] / total * 100:.0f}%")
+
+    counts = store.event_counts(("escalated", "auto_integrated", "crashed",
+                                 "retrieval_exhausted", "visual_gate_error",
+                                 "visual_gate_skipped"))
+    print(f"\nqueue: {queue_stats(tasks)}")
+    for kind in sorted(counts):
+        print(f"  {kind:<22} {counts[kind]}")
+
+    print("\nsubscription tokens by role (the quota proxy):")
+    for row in store.subscription_tokens_by_role():
+        in_tok = row["in_tok"] or 0
+        per_task = f"{in_tok / done:,.0f}" if done else "-"
+        print(f"  {row['role']:<16} calls={row['calls']:<4} in={in_tok:<10} "
+              f"out={row['out_tok'] or 0:<9} cache_hit={row['cache_hit'] or 0:<10} "
+              f"in/completed_task={per_task}")
+    if not done:
+        print("  (no completed tasks yet — per-task figures need a finished run)")
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -136,9 +172,19 @@ def main(argv: list[str] | None = None) -> int:
         print("\nusage by role/model:")
         for row in store.usage_summary():
             tag = "" if row["cash"] else "  (subscription)"
+            hit, miss = row["cache_hit"] or 0, row["cache_miss"] or 0
+            # Hit rate over the cached+uncached input the provider actually
+            # reported — "-" (not 0%) when a provider reports no cache telemetry
+            # at all, so an unknown never reads as a measured cold cache.
+            rate = f"{hit / (hit + miss) * 100:.0f}%" if (hit + miss) else "-"
             print(f"  {row['role']:<16} {row['model']:<28} calls={row['calls']:<4} "
                   f"in={row['in_tok'] or 0:<9} out={row['out_tok'] or 0:<8} "
+                  f"cache_hit={hit:<9} cache_miss={miss:<9} hit_rate={rate:<5} "
                   f"${row['cost'] or 0:.3f}{tag}")
+        return 0
+
+    if args.command == "metrics":
+        _print_metrics(Store(cfg.store_path()))
         return 0
 
     if args.command == "import-backlog":

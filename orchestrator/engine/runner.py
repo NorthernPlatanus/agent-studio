@@ -77,6 +77,34 @@ def _filtered(ctx: RunContext, task_filter: set[str] | None) -> list[dict]:
     return tasks
 
 
+async def _run_batch(batch: list[dict], run_task) -> None:
+    """Run a batch, and when one task raises the run-level pause signal, STOP the
+    others.
+
+    A bare `asyncio.gather` propagates the first exception immediately but leaves
+    the siblings running: `run_task` deliberately re-raises LimitExhausted /
+    BudgetExceeded, so the pause handler would bookkeep a "paused" run while other
+    tasks were still mid-LLM-call, mid-gate, or about to `integrate` — and a merge
+    could land on the feature branch after the run was reported stopped, with the
+    SQLite writes racing the pause. "Checkpoint and stop" has to mean stop.
+
+    Cancellation lands inside `asyncio.to_thread` in some cases; a thread can't be
+    interrupted, so an in-flight git/gate call finishes before the cancellation is
+    observed. That is acceptable — those calls are short, and the LangGraph
+    checkpoint makes whatever they completed resumable.
+    """
+    tasks = [asyncio.create_task(run_task(t)) for t in batch]
+    done, pending = await asyncio.wait(tasks, return_when=asyncio.FIRST_EXCEPTION)
+    for p in pending:
+        p.cancel()
+    if pending:
+        await asyncio.gather(*pending, return_exceptions=True)
+    for d in done:
+        exc = d.exception()
+        if exc is not None:
+            raise exc
+
+
 async def run(cfg: Config, *, dry_run: bool = False,
               task_filter: set[str] | None = None,
               n_candidates: int | None = None,
@@ -132,7 +160,7 @@ async def run(cfg: Config, *, dry_run: bool = False,
                 if not batch:
                     break
                 log.info("run %s: batch %s", run_id, [t["id"] for t in batch])
-                await asyncio.gather(*(run_task(t) for t in batch))
+                await _run_batch(batch, run_task)
             store.set_run_status(run_id, "done")
             stats = queue_stats(store.all_tasks())
             print(f"\nrun {run_id} complete. queue: {stats}")

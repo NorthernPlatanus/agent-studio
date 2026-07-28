@@ -7,7 +7,6 @@ checkpoints portable and resumable.
 
 from __future__ import annotations
 
-import operator
 from typing import Annotated, Any
 
 from typing_extensions import TypedDict
@@ -28,13 +27,54 @@ Candidate = dict[str, Any]
 #   gate_log: str       failure tail (on gate_failed)
 #   error: str          patch/llm error text
 #   notes: str          worker's own plan/notes
+#   visual_facts: dict  measured scene facts from an ENFORCED visual gate pass
+#                       (absent when the gate is off, skipped, or produced none).
+#                       Fed into the review payload: the reviewer cannot observe
+#                       anything itself, so these are the only evidence it gets
+#                       about the running scene rather than the diff's claims.
 #   messages: list[dict] per-CANDIDATE warm chat history (plain role/content
 #                        dicts only — never LangChain message objects, or the
-#                        checkpoint breaks). Flows through the operator.add
-#                        reducer; latest_candidates() gives the warm chain per
+#                        checkpoint breaks). Flows through the add_candidates
+#                        reducer, which keeps the transcript ONLY on the newest
+#                        attempt; latest_candidates() gives the warm chain per
 #                        candidate. This is per-candidate on purpose: a single
 #                        task-level add_messages channel would interleave all N
 #                        candidates' turns into one history.
+
+
+def add_candidates(left: list[Candidate] | None,
+                   right: list[Candidate] | None) -> list[Candidate]:
+    """Reducer for `candidates`: append, then keep `messages` only on the newest
+    attempt per candidate id.
+
+    Plain `operator.add` stored a COMPLETE copy of every attempt's chat — and the
+    first turn of that chat is the frozen prefix with every files_read file
+    inlined. A task with a 60k-token file block, 3 candidates and 4 attempts
+    checkpointed ~12 copies of it, so the SQLite checkpoint (and every
+    `aget_state` on resume) grew roughly quadratically in attempts.
+
+    Nothing reads a superseded attempt's messages: `fan_out` warms a retry from
+    `latest_candidates`, which already collapses to the newest per cand_id. The
+    superseded entries keep status / gate_log / error / diff, so the audit trail
+    of what each attempt did is intact — only the redundant transcript goes.
+
+    Supersession matches `latest_candidates` exactly (`attempt >=`, so a
+    same-attempt `visual_failed` supersedes the `gate_passed` it replaces); the
+    LAST entry at the winning attempt is the one that keeps its messages.
+    """
+    merged = list(left or []) + list(right or [])
+    winner: dict[str, int] = {}
+    for i, cand in enumerate(merged):
+        cid = cand["cand_id"]
+        prev = winner.get(cid)
+        if prev is None or cand["attempt"] >= merged[prev]["attempt"]:
+            winner[cid] = i
+    keep = set(winner.values())
+    # Idempotent: an already-stripped entry has a falsy `messages` and is
+    # returned as-is, so repeated reducer calls copy nothing.
+    return [cand if i in keep or not cand.get("messages")
+            else {**cand, "messages": []}
+            for i, cand in enumerate(merged)]
 
 
 class TaskState(TypedDict, total=False):
@@ -46,7 +86,7 @@ class TaskState(TypedDict, total=False):
     to_run: list[str]     # candidate ids to (re)run this attempt
     feedback: str         # gate/review notes injected into the next attempt
     escalated: bool       # set once when a task hands off to the subscription senior
-    candidates: Annotated[list[Candidate], operator.add]
+    candidates: Annotated[list[Candidate], add_candidates]
     verdict: dict         # {"decision", "winner", "notes"}
     integration: dict     # {"merged_commit"}
     outcome: str          # done | failed | rejected

@@ -6,10 +6,19 @@ winning branches into the feature branch through a dedicated integration
 worktree — the user's primary checkout is never touched.
 
 In dry-run mode every mutating call raises DryRunViolation.
+
+Concurrency: git serializes on `.git/index.lock`, and it does NOT wait — a second
+mutating command against the same `.git` fails outright. With max_parallel_tasks
+× n_candidates worktree creations plus the shared `_integration` worktree, that
+is up to a dozen concurrent mutations, so the ref-touching entry points are
+guarded by REPO_LOCK (see `Git.repo_lock`). Callers hop through
+`asyncio.to_thread`, so the lock must be an asyncio lock held by the async
+caller — a threading lock inside these sync methods would block the event loop.
 """
 
 from __future__ import annotations
 
+import asyncio
 import subprocess
 from pathlib import Path
 
@@ -24,6 +33,55 @@ class Git:
         self.feature = feature_branch
         self.base = base_branch
         self.dry_run = dry_run
+        self._lock: asyncio.Lock | None = None
+
+    # ---- concurrency -------------------------------------------------------
+    @property
+    def repo_lock(self) -> asyncio.Lock:
+        """Serializes ref-mutating git commands against this repo. Created lazily
+        so it binds to the running loop (one Git instance == one run == one loop),
+        never at import time."""
+        if self._lock is None:
+            self._lock = asyncio.Lock()
+        return self._lock
+
+    async def _locked(self, fn, *args):
+        """Run a mutating git method under the repo lock, off the event loop.
+
+        Prefer these async wrappers over `asyncio.to_thread(git.<method>)` at call
+        sites: git's own locking (`.git/index.lock`) fails fast rather than
+        waiting, so unserialized concurrent worktree/branch commands don't queue —
+        they error, and can leave `*.lock` debris behind."""
+        async with self.repo_lock:
+            return await asyncio.to_thread(fn, *args)
+
+    async def acreate_worktree(self, name: str, from_branch: str | None = None) -> Path:
+        return await self._locked(self.create_worktree, name, from_branch)
+
+    async def aremove_worktree(self, name: str) -> None:
+        await self._locked(self.remove_worktree, name)
+
+    async def amerge_into_feature(self, branch: str, message: str) -> str:
+        return await self._locked(self.merge_into_feature, branch, message)
+
+    async def adelete_branch(self, branch: str) -> None:
+        await self._locked(self.delete_branch, branch)
+
+    async def acommit_all(self, worktree: Path, message: str) -> str:
+        """Commit a candidate worktree under the repo lock.
+
+        HARDENING, not a fix for a demonstrated race: committing runs in a
+        worktree, so the index is private and each candidate updates a DIFFERENT
+        ref (`refs/heads/agents/wt/<name>`), which git locks per-ref. Attempts to
+        reproduce a failure — 12 concurrent commits, and commits interleaved with
+        `worktree prune`/`add` from sibling tasks — came back clean.
+
+        It is still routed through the lock so that EVERY repo-mutating entry
+        point has the same shape: `create_worktree` does race (see
+        tests/test_gitops_concurrency.py), and the value of the `a*` wrappers is
+        that no call site has to know which commands are the dangerous ones.
+        Serializing three short commits costs nothing."""
+        return await self._locked(self.commit_all, worktree, message)
 
     # ---- plumbing --------------------------------------------------------
     def _git(self, *args: str, cwd: Path | None = None, check: bool = True,

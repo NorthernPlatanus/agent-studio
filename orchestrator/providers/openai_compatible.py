@@ -57,7 +57,16 @@ class OpenAICompatibleProvider(LLMProvider):
 
     async def complete(self, *, model: str, system: str, user: str,
                        cwd: str | None = None,
-                       params: dict | None = None) -> LLMResult:
+                       params: dict | None = None,
+                       session: str | None = None,
+                       effort: str | None = None,
+                       allowed_tools: str | None = None,
+                       mcp_config: str | None = None) -> LLMResult:
+        # `session` is ignored: a chat-completions endpoint is stateless, so the
+        # full messages array IS the context (and session_active() says False, so
+        # callers never abbreviate on this provider). `effort` is ignored too —
+        # the cheap worker models have no reasoning-effort dial, and callers pass
+        # None for them anyway (RunContext.worker_effort).
         return await self._chat(model, [
             {"role": "system", "content": system},
             {"role": "user", "content": user},
@@ -65,9 +74,14 @@ class OpenAICompatibleProvider(LLMProvider):
 
     async def complete_chat(self, *, model: str, system: str,
                             messages: list[dict], cwd: str | None = None,
-                            params: dict | None = None) -> LLMResult:
+                            params: dict | None = None,
+                            session: str | None = None,
+                            effort: str | None = None,
+                            allowed_tools: str | None = None,
+                            mcp_config: str | None = None) -> LLMResult:
         """Pass the native OpenAI messages array through so the endpoint's
-        automatic prefix caching sees a byte-stable prefix across turns."""
+        automatic prefix caching sees a byte-stable prefix across turns.
+        `session`/`effort` are accepted for signature parity and ignored."""
         wire = [{"role": "system", "content": system}] + [
             {"role": m["role"], "content": m["content"]} for m in messages
             if m.get("role") != "system"]

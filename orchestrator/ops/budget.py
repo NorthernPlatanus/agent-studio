@@ -27,6 +27,11 @@ class Budget:
     # CLI provider types are subscription-metered by default (not cash).
     _CLI_TYPES = ("claude_cli", "codex_cli")
 
+    # Rough bytes-per-token for the pre-flight estimate. Deliberately LOW (real
+    # English/code averages ~3.5-4), so the estimate over-counts tokens and the
+    # guard errs toward stopping early rather than overshooting.
+    _CHARS_PER_TOKEN = 3.0
+
     def __init__(self, cfg, store: Store, run_id: str):
         self.store = store
         self.run_id = run_id
@@ -34,12 +39,24 @@ class Budget:
         self.per_run = float(cfg.budget.per_run_usd)
         self.count_claude_cli = bool(cfg.budget.get("count_claude_cli", False))
         self.count_cli = bool(cfg.budget.get("count_cli", False))
+        self.assumed_max_output = int(
+            cfg.budget.get("assumed_max_output_tokens", 8000))
         # Snapshot provider configs so record() can consult per-provider `auth`
         # and `count` without holding the whole Config.
         self._providers: dict[str, dict] = {}
         for name in (cfg.get("providers") or {}).keys():
             entry = cfg.providers.get(name)
             self._providers[name] = entry.as_dict() if entry is not None else {}
+        # model id -> ($/Mtok in, $/Mtok out), for the pre-flight estimate only;
+        # recorded cost still comes from the provider.
+        self._prices: dict[str, tuple[float, float]] = {}
+        for wm in (cfg.get("worker_models") or {}).keys():
+            entry = cfg.worker_models.get(wm)
+            if entry is None:
+                continue
+            self._prices[entry.get("model")] = (
+                float(entry.get("input_per_mtok", 0) or 0),
+                float(entry.get("output_per_mtok", 0) or 0))
 
     def _is_cash(self, provider: str, provider_type: str) -> bool:
         pcfg = self._providers.get(provider, {})
@@ -66,14 +83,56 @@ class Budget:
                  output_tokens, cost_usd, "" if cash else " (subscription)")
         self.check(task_id)
 
+    def estimate_and_check(self, *, task_id: str | None, provider: str,
+                           provider_type: str, model: str,
+                           prompt_chars: int,
+                           max_output_tokens: int | None = None) -> float:
+        """Pre-flight guard: refuse a call whose ESTIMATED cost would breach a cap.
+
+        `record()` writes the row and then checks, so a single large call can
+        overshoot `per_task_usd` / `per_run_usd` by an unbounded amount before the
+        exception fires — mild on the cheap tier today, serious the moment a
+        smart tier moves to metered billing. This runs before the call instead.
+
+        The estimate is deliberately conservative (low chars-per-token, and the
+        full configured output allowance assumed spent), so it stops early rather
+        than late; `record()`'s post-hoc check stays as the exact backstop.
+        Returns the estimate in USD (0.0 for subscription-metered calls, which
+        are exempt and never blocked). Raises BudgetExceeded.
+        """
+        if not self._is_cash(provider, provider_type):
+            return 0.0
+        price_in, price_out = self._prices.get(model, (0.0, 0.0))
+        if not price_in and not price_out:
+            return 0.0            # no price table entry: nothing to estimate from
+        in_tok = prompt_chars / self._CHARS_PER_TOKEN
+        out_tok = max_output_tokens or self.assumed_max_output
+        estimate = in_tok / 1e6 * price_in + out_tok / 1e6 * price_out
+
+        run_spend = self.store.run_cash_spend(self.run_id)
+        if run_spend + estimate > self.per_run:
+            raise BudgetExceeded(
+                f"run budget would be exceeded by the next call: "
+                f"${run_spend:.2f} spent + ~${estimate:.2f} est > ${self.per_run:.2f}")
+        if task_id:
+            task_spend = self.store.task_cash_spend(task_id, run_id=self.run_id)
+            if task_spend + estimate > self.per_task:
+                raise BudgetExceeded(
+                    f"task {task_id} budget would be exceeded by the next call: "
+                    f"${task_spend:.2f} spent + ~${estimate:.2f} est > "
+                    f"${self.per_task:.2f}")
+        return estimate
+
     def check(self, task_id: str | None = None) -> None:
         run_spend = self.store.run_cash_spend(self.run_id)
         if run_spend > self.per_run:
             raise BudgetExceeded(
                 f"run budget exceeded: ${run_spend:.2f} > ${self.per_run:.2f}")
         if task_id:
-            task_spend = self.store.task_cash_spend(task_id)
+            # Scoped to THIS run: the cap is "what this run may spend on the
+            # task", not a lifetime total that a re-run inherits already blown.
+            task_spend = self.store.task_cash_spend(task_id, run_id=self.run_id)
             if task_spend > self.per_task:
                 raise BudgetExceeded(
-                    f"task {task_id} budget exceeded: "
+                    f"task {task_id} budget exceeded in run {self.run_id}: "
                     f"${task_spend:.2f} > ${self.per_task:.2f}")

@@ -2,29 +2,39 @@
 
 A green deterministic gate means "it compiles/tests pass", not "it renders
 correctly": a three.js scene can build clean and show a grey screen. This gate
-starts the app in the candidate worktree, drives a pluggable MCP inspector to
-fetch structured scene-graph facts, and evaluates project-defined assertions
-over them. Zero LLM tokens.
+starts the app in the candidate worktree, collects structured scene-graph facts,
+and evaluates project-defined assertions over them. Zero LLM tokens.
 
 Design points:
-  * Project-agnostic: the inspector is a `mcp:` entry (threejs now, unity/blender
-    later). This op is its OWN MCP CLIENT (the existing plumbing only hands config
-    paths to the Claude CLI); the client is injected/best-effort.
+  * The fact source is a SUBPROCESS THAT PRINTS JSON (`visual_gate.facts_cmd`),
+    not an MCP client. A headless dump script — a three.js/R3F scene walk, or
+    `blender --background --python dump_scene.py` — is the cheapest credible
+    inspector, needs no client to exist, and works for any engine that can print
+    a dict. `check(fetch_facts=...)` stays injectable, so a real MCP client can
+    be dropped in later without touching the evaluator.
   * Safe assertions: a restricted AST evaluator over the returned JSON — NEVER
     eval(). Only comparisons, boolean/arithmetic ops, attribute/subscript access,
     comprehensions, and a tiny allowlist of pure builtins.
   * Process lifecycle: the dev/app process is spawned in its own process group
     and the whole group is killed on teardown (no `npm run dev &` orphans).
+  * A BROKEN fact source is a failure, never a pass: a non-zero exit, malformed
+    JSON, or a ready_probe timeout fails the candidate with the reason attached.
+    Only a gate that is disabled — or enabled with no fact source configured at
+    all — passes through, and that pass is marked `enforced=False` so the caller
+    can log it as skipped rather than green.
 """
 
 from __future__ import annotations
 
 import ast
+import json
 import logging
 import os
 import signal
 import subprocess
 import time
+import urllib.error
+import urllib.request
 from dataclasses import dataclass, field
 from pathlib import Path
 
@@ -233,14 +243,69 @@ def _teardown(proc: subprocess.Popen | None) -> None:
             proc.kill()
 
 
+class FactSourceError(Exception):
+    """The fact source could not produce facts (exit code, bad JSON, timeout).
+    Fails the candidate — never silently passes it."""
+
+
+def facts_from_cmd(cmd: str, cwd: Path, timeout_s: int) -> dict:
+    """Run `cmd` in the worktree and parse its stdout as a JSON object.
+
+    This is the whole inspector contract: print a dict of facts, exit 0. stderr
+    is captured for the failure message but ignored on success, so a script may
+    log freely."""
+    try:
+        proc = subprocess.run(cmd, shell=True, cwd=str(cwd), capture_output=True,
+                              text=True, timeout=timeout_s)
+    except subprocess.TimeoutExpired as e:
+        raise FactSourceError(f"facts_cmd timed out after {timeout_s}s: {cmd}") from e
+    except OSError as e:
+        raise FactSourceError(f"facts_cmd could not run: {e}") from e
+    if proc.returncode != 0:
+        raise FactSourceError(
+            f"facts_cmd exited {proc.returncode}: "
+            f"{(proc.stderr or proc.stdout).strip()[:1000]}")
+    try:
+        facts = json.loads(proc.stdout)
+    except json.JSONDecodeError as e:
+        raise FactSourceError(
+            f"facts_cmd did not print JSON ({e}): {proc.stdout.strip()[:500]}") from e
+    if not isinstance(facts, dict):
+        raise FactSourceError(
+            f"facts_cmd printed {type(facts).__name__}, expected a JSON object")
+    return facts
+
+
+def wait_for_probe(url: str, timeout_s: int, interval_s: float = 0.5) -> None:
+    """Block until `url` answers (any HTTP status counts — a 404 still proves the
+    server is up), or raise FactSourceError at the deadline. Polling an HTTP URL
+    is all `ready_probe` ever needed to mean."""
+    deadline = time.monotonic() + timeout_s
+    last = ""
+    while time.monotonic() < deadline:
+        try:
+            urllib.request.urlopen(url, timeout=2).close()
+            return
+        except urllib.error.HTTPError:
+            return                      # served a response: it's up
+        except Exception as e:          # not listening yet / DNS / connreset
+            last = str(e)
+        time.sleep(interval_s)
+    raise FactSourceError(f"ready_probe {url} not ready after {timeout_s}s: {last}")
+
+
 def check(cfg, worktree: Path, *, fetch_facts=None, wait_ready=None) -> VisualResult:
     """Run the visual gate for one candidate worktree.
 
-    `fetch_facts()` returns the scene-graph facts dict from the MCP inspector
-    (injected so this is testable and so the MCP client stays best-effort).
-    `wait_ready()` blocks until the app is serving. When the gate is disabled or
-    no fact source is available, returns a PASS (pass-through) — the harness must
-    run fine with visual_gate.enabled:false.
+    `fetch_facts()` returns the scene-graph facts dict; `wait_ready()` blocks
+    until the app is serving. Both default to the configured `facts_cmd` /
+    `ready_probe` and exist as parameters so tests (and a future MCP client) can
+    substitute their own.
+
+    Passes through ONLY when the gate is disabled, or enabled with no fact source
+    configured — that pass carries `enforced=False` so the caller can log it as
+    skipped. Every other failure path (bad JSON, non-zero exit, probe timeout)
+    fails the candidate with the reason recorded.
     """
     vg = cfg.get("visual_gate") or {}
     get = vg.get if hasattr(vg, "get") else (lambda k, d=None: d)
@@ -248,20 +313,46 @@ def check(cfg, worktree: Path, *, fetch_facts=None, wait_ready=None) -> VisualRe
         return VisualResult(passed=True)
     assertions = list(get("assertions", []) or [])
     run_cmd = get("run_cmd")
+    facts_cmd = get("facts_cmd")
+    facts_timeout = int(get("facts_timeout_s", 120) or 120)
+    probe = get("ready_probe")
+    ready_timeout = int(get("ready_timeout_s", 60) or 60)
+
+    if fetch_facts is None and facts_cmd:
+        def fetch_facts():
+            return facts_from_cmd(facts_cmd, worktree, facts_timeout)
+    # The probe waits for the app WE start, so it is only meaningful alongside
+    # run_cmd. Polling without it would burn the whole ready_timeout against a
+    # port nobody is serving and then fail every visual candidate — a config with
+    # ready_probe but no run_cmd is a mistake, not a request to block. An
+    # explicitly injected wait_ready always runs; the caller knows what it wants.
+    if wait_ready is None and probe and run_cmd:
+        def wait_ready():
+            return wait_for_probe(probe, ready_timeout)
+    elif wait_ready is None and probe:
+        log.warning("visual_gate.ready_probe is set but run_cmd is not — nothing "
+                    "to wait for; skipping the probe")
+
+    if fetch_facts is None:
+        # Enabled but nothing to ask: don't block the pipeline, and don't pretend
+        # this was verified (enforced=False -> the caller logs visual_gate_skipped).
+        log.warning("visual_gate enabled but no facts_cmd/fetch_facts; passing through")
+        return VisualResult(passed=True)
 
     proc = None
     try:
-        if run_cmd and fetch_facts is not None:
+        if run_cmd:
             proc = _spawn(run_cmd, worktree)
-            if wait_ready is not None:
-                wait_ready()
-        if fetch_facts is None:
-            # No inspector wired (best-effort) — don't block the pipeline.
-            log.warning("visual_gate enabled but no fact source; passing through")
-            return VisualResult(passed=True)
+        if wait_ready is not None:
+            wait_ready()
         facts = fetch_facts()
         failures = run_assertions(assertions, facts)
         return VisualResult(passed=not failures, failures=failures, facts=facts,
+                            enforced=True)
+    except FactSourceError as e:
+        # An inspector that crashes must not look like a scene that renders.
+        log.warning("visual_gate fact source failed in %s: %s", worktree, e)
+        return VisualResult(passed=False, failures=[f"fact source failed: {e}"],
                             enforced=True)
     finally:
         _teardown(proc)

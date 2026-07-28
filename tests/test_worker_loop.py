@@ -41,11 +41,22 @@ class FakeGit:
         wt.mkdir(parents=True, exist_ok=True)
         return wt
 
+    async def acreate_worktree(self, name, from_branch=None):
+        # Mirrors Git.acreate_worktree (locked async wrapper). Tests that swap in
+        # their own create_worktree still work: this dispatches through the
+        # attribute, not the class body.
+        return self.create_worktree(name)
+
     def wt_branch(self, name):
         return f"wt/{name}"
 
     def commit_all(self, wt, msg):
         pass
+
+    async def acommit_all(self, wt, msg):
+        # Mirrors Git.acommit_all (locked async wrapper); dispatches through the
+        # attribute so a test that swaps commit_all still sees its own version.
+        return self.commit_all(wt, msg)
 
     def diff_against_feature(self, wt):
         return "DIFF"
@@ -66,6 +77,9 @@ class FakeBudget:
     def record(self, **k):
         pass
 
+    def estimate_and_check(self, **k):
+        return 0.0
+
 
 class ScriptedProvider:
     type = "fake"
@@ -75,12 +89,14 @@ class ScriptedProvider:
         self.calls = 0
         self.last_messages = None
 
-    async def complete(self, *, model, system, user, cwd=None, params=None):
+    async def complete(self, *, model, system, user, cwd=None, params=None,
+                       session=None, effort=None):
         text = self.responses[min(self.calls, len(self.responses) - 1)]
         self.calls += 1
         return LLMResult(text=text)
 
-    async def complete_chat(self, *, model, system, messages, cwd=None, params=None):
+    async def complete_chat(self, *, model, system, messages, cwd=None,
+                            params=None, session=None, effort=None):
         self.last_messages = messages
         self.last_params = params
         text = self.responses[min(self.calls, len(self.responses) - 1)]
@@ -139,3 +155,20 @@ async def test_retrieval_exhaustion_forces_final_and_logs(tmp_path, monkeypatch)
     kinds = [k for k, _ in store.events]
     assert "retrieval" in kinds
     assert "retrieval_exhausted" in kinds
+
+
+async def test_worker_refuses_spec_without_files_write(tmp_path, monkeypatch):
+    """Belt for specs planned before persist_specs validated files_write: an
+    absent allowlist must fail closed, before any tokens are spent."""
+    ctx, store = _ctx(tmp_path)
+    provider = ScriptedProvider(['<file path="anywhere.txt">\nx\n</file>'])
+    monkeypatch.setattr(worker_mod, "get_provider", lambda cfg, name: provider)
+    spec = _spec()
+    del spec["files_write"]
+    out = await worker_mod.run_candidate(ctx, {
+        "run_id": "r", "task_id": "T-1", "spec": spec, "cand_id": "w",
+        "attempt": 1, "feedback": ""})
+    cand = out["candidates"][0]
+    assert cand["status"] == "patch_failed"
+    assert "files_write" in cand["error"]
+    assert provider.calls == 0            # refused before the LLM call

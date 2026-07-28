@@ -191,10 +191,20 @@ class Store:
             (run_id,)).fetchone()
         return row["s"]
 
-    def task_cash_spend(self, task_id: str) -> float:
-        row = self._conn.execute(
-            "SELECT COALESCE(SUM(cost_usd),0) s FROM usage WHERE task_id=? AND cash=1",
-            (task_id,)).fetchone()
+    def task_cash_spend(self, task_id: str, run_id: str | None = None) -> float:
+        """Cash spent on a task. `run_id` scopes it to one run — which is what the
+        BUDGET path wants: an unscoped sum makes a re-planned or re-run task start
+        already over its per-task cap and pause immediately, blaming the current
+        run for a previous one's spend. Reporting (`status`, backlog writeback)
+        wants the unscoped lifetime figure, so that stays the default."""
+        if run_id is None:
+            row = self._conn.execute(
+                "SELECT COALESCE(SUM(cost_usd),0) s FROM usage "
+                "WHERE task_id=? AND cash=1", (task_id,)).fetchone()
+        else:
+            row = self._conn.execute(
+                "SELECT COALESCE(SUM(cost_usd),0) s FROM usage "
+                "WHERE task_id=? AND run_id=? AND cash=1", (task_id, run_id)).fetchone()
         return row["s"]
 
     def usage_summary(self) -> list[dict]:
@@ -204,6 +214,45 @@ class Store:
                       SUM(cache_hit_tokens) cache_hit, SUM(cache_miss_tokens) cache_miss,
                       SUM(cost_usd) cost, MAX(cash) cash
                FROM usage GROUP BY role, provider, model ORDER BY cost DESC"""
+        ).fetchall()
+        return [dict(r) for r in rows]
+
+    def gate_outcomes(self) -> list[dict]:
+        """Per-candidate gate pass/fail counts, split by attempt 1 vs later.
+
+        The `events` rows look like `<cand_id> attempt=<n> passed=<bool>`; parsing
+        them here keeps the solve-rate question ("which worker actually lands a
+        task on the first try?") a single query instead of an ad-hoc script."""
+        rows = self._conn.execute(
+            "SELECT detail FROM events WHERE kind='gate'").fetchall()
+        agg: dict[tuple[str, bool], dict] = {}
+        for r in rows:
+            parts = (r["detail"] or "").split()
+            if len(parts) < 3:
+                continue
+            cand, attempt, passed = parts[0], parts[1], parts[2]
+            first = attempt == "attempt=1"
+            key = (cand, first)
+            a = agg.setdefault(key, {"cand_id": cand, "first_attempt": first,
+                                     "passed": 0, "failed": 0})
+            a["passed" if passed == "passed=True" else "failed"] += 1
+        return sorted(agg.values(), key=lambda a: (a["cand_id"], not a["first_attempt"]))
+
+    def event_counts(self, kinds: tuple[str, ...]) -> dict[str, int]:
+        q = ",".join("?" for _ in kinds)
+        rows = self._conn.execute(
+            f"SELECT kind, COUNT(*) n FROM events WHERE kind IN ({q}) GROUP BY kind",
+            kinds).fetchall()
+        return {r["kind"]: r["n"] for r in rows}
+
+    def subscription_tokens_by_role(self) -> list[dict]:
+        """Subscription-tier (cash=0) token totals per role — the quota proxy.
+        Divided by completed tasks, this is the number that decides whether the
+        cheap worker tier earns its place."""
+        rows = self._conn.execute(
+            """SELECT role, COUNT(*) calls, SUM(input_tokens) in_tok,
+                      SUM(output_tokens) out_tok, SUM(cache_hit_tokens) cache_hit
+               FROM usage WHERE cash=0 GROUP BY role ORDER BY in_tok DESC"""
         ).fetchall()
         return [dict(r) for r in rows]
 
