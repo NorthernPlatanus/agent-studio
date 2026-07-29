@@ -209,6 +209,13 @@ def load_config(project: str | None = None, root: Path | None = None) -> Config:
                 f"No project profile: looked for {new_profile} and {legacy_profile}"
             )
         data = _deep_merge(data, _load_yaml(profile))
-    data = _deep_merge(data, _load_yaml(cfg_dir / "local.yaml"))
+    # ORCH_SKIP_LOCAL_CONFIG: drop the machine-local overlay. Set by the test
+    # suite (tests/conftest.py) so unit tests read the committed defaults and
+    # not whatever this developer happens to have in config/local.yaml — a real
+    # `gate.install_cmd` there otherwise makes worker tests shell out to a real
+    # `npm ci`, so the suite passes or fails depending on whose laptop it is.
+    # Not a knob for normal runs; nothing but the tests should set it.
+    if not os.environ.get("ORCH_SKIP_LOCAL_CONFIG"):
+        data = _deep_merge(data, _load_yaml(cfg_dir / "local.yaml"))
     data = _apply_env(data)
     return Config(data, project or "default", root)

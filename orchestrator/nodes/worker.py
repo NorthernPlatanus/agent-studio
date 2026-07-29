@@ -281,16 +281,48 @@ async def run_candidate(ctx: RunContext, payload: dict) -> dict:
         else:
             cand["status"] = "gate_failed"
             cand["gate_log"] = f"[{gate.failed_step}]\n{gate.log_tail}"
-        ctx.store.log_event(ctx.run_id, task_id, "gate",
-                            f"{cand_id} attempt={attempt} passed={gate.passed}")
+            # Which step went red is the single most useful thing about a failed
+            # attempt, and `gate_log` is in-memory graph state only — without
+            # this the run log and the store both say `passed=False` and nothing
+            # more, so a post-mortem can't tell a typecheck error from a
+            # timed-out build without re-running the whole task.
+            log.warning("%s/%s attempt %d gate FAILED at: %s\n%s",
+                        task_id, cand_id, attempt, gate.failed_step,
+                        (gate.log_tail or "")[-1500:])
+        ctx.store.log_event(
+            ctx.run_id, task_id, "gate",
+            f"{cand_id} attempt={attempt} passed={gate.passed}"
+            + ("" if gate.passed else
+               f" failed_step={gate.failed_step}\n{(gate.log_tail or '')[-2000:]}"))
 
     except (LimitExhausted, BudgetExceeded):
         raise  # run-level control flow: checkpoint & pause
     except PatchError as e:
         cand["status"] = "patch_failed"
         cand["error"] = str(e)[:4000]
+        _log_candidate_failure(ctx, task_id, cand_id, attempt, cand)
     except OrchestratorError as e:
         cand["status"] = "llm_failed"
         cand["error"] = str(e)[:4000]
+        _log_candidate_failure(ctx, task_id, cand_id, attempt, cand)
 
     return {"candidates": [cand]}
+
+
+def _log_candidate_failure(ctx, task_id: str, cand_id: str, attempt: int,
+                           cand: dict) -> None:
+    """Surface a candidate's failure reason to the log AND the event store.
+
+    Without this the reason lives only in `cand["error"]`, which is in-memory
+    graph state: a run whose every attempt died before the LLM was even called
+    (`ensure_deps` raising on a broken `npm ci`, say) printed three
+    `dispatch attempt N` lines, an `escalated`, and `finalized: failed` — and
+    nothing, anywhere, saying why. Logged at WARNING (an attempt failing is not
+    itself fatal — the graph may still retry or escalate) and mirrored into the
+    store so `status`/`metrics` can show it after the process is gone.
+    """
+    reason = str(cand.get("error", ""))[:1000]
+    log.warning("%s/%s attempt %d %s: %s",
+                task_id, cand_id, attempt, cand["status"], reason)
+    ctx.store.log_event(ctx.run_id, task_id, "candidate_failed",
+                        f"{cand_id} attempt={attempt} {cand['status']}: {reason}")
