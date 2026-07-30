@@ -10,6 +10,7 @@ from __future__ import annotations
 import json
 import logging
 import re
+from pathlib import Path
 
 from ..core.context import RunContext
 from ..providers import get_provider
@@ -117,6 +118,43 @@ def build_review_prompt(spec: dict, passed: dict) -> str:
     return "\n".join(parts)
 
 
+def review_cwd(ctx: RunContext, passed: dict) -> str:
+    """Where the reviewer's read-only tools (Read/Grep/Glob) are rooted.
+
+    It used to be `repo_path()` — the user's primary checkout, sitting on
+    `base_branch`. The reviewer really does read files (the provider grants
+    Read,Grep,Glob precisely so it can), so it was inspecting a tree that does
+    NOT contain the diff it is judging, and that lacks every wave merged into
+    the feature branch since. Observed: a reviewer hunting for a helper added by
+    the previous task, not finding it, and saying so in its own verdict — after
+    burning 123k-167k input tokens exploring (vs ~43k when it answers from the
+    diff).
+
+    Precedence:
+      1. the single gate-passing candidate's own worktree — the exact tree the
+         diff came from, so a lookup either confirms or refutes the diff;
+      2. the `_integration` worktree (on the feature branch): the true base every
+         candidate was built from. For best-of-N this is the only honest choice —
+         browsing candidate A's tree while judging B would mix them;
+      3. `repo_path()`, if `_integration` has not been created yet (it is made
+         lazily on the first merge). Stale, but it always exists.
+
+    Both worktree branches are checked for existence before being returned (3 is
+    the last resort precisely because it always exists): the whole reason this
+    function has a fallback at all is that a cwd which does not exist kills the
+    provider subprocess, and a path recorded on a candidate is not proof of a
+    directory on disk — `finalize` removes worktrees, and a resumed checkpoint
+    outlives them.
+    """
+    worktrees = [c["worktree"] for c in passed.values() if c.get("worktree")]
+    if len(passed) == 1 and len(worktrees) == 1 and Path(worktrees[0]).exists():
+        return worktrees[0]
+    integration = ctx.git.work_dir / "_integration" if ctx.git is not None else None
+    if integration is not None and integration.exists():
+        return str(integration)
+    return str(ctx.cfg.repo_path())
+
+
 def _facts_json(facts: dict, max_chars: int = 4000) -> str:
     """Deterministic, size-capped rendering of the fact dict.
 
@@ -146,7 +184,7 @@ async def review(ctx: RunContext, state: TaskState) -> dict:
 
     result = await provider.complete(model=model, system=system,
                                      user=build_review_prompt(spec, passed),
-                                     cwd=str(ctx.cfg.repo_path()),
+                                     cwd=review_cwd(ctx, passed),
                                      effort=ctx.role_effort("reviewer"))
     ctx.budget.record(
         task_id=state["task_id"], role="reviewer", provider=provider_name,

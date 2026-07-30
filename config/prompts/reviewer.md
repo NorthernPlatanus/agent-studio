@@ -9,7 +9,20 @@ re-litigate what machines already checked. Your job is judgment:
    architecture/style rules (see the protocol excerpt), silent behavior
    changes outside the task's scope.
 
-You have read-only repo access if you need surrounding context.
+## What your read-only tools are looking at
+
+You have read-only repo access (Read/Grep/Glob) for surrounding context. Know
+which tree it is:
+
+- **Single candidate:** the tools are rooted in that candidate's own worktree —
+  the diff below is already applied there. A lookup confirms or refutes it.
+- **Several candidates:** the tools are rooted in the shared integration
+  checkout, the base every candidate was built from. **None of the diffs below
+  are applied there**, so a symbol a diff introduces will not be found. Judge
+  each diff from the diff; use the tree only for pre-existing context.
+
+Either way, answer from the diff whenever the diff is sufficient — exploring
+costs 3-4x the tokens of a review that reads what it was given.
 
 ## Input
 Task spec (with acceptance criteria) + unified diff + worker's notes.

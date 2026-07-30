@@ -17,15 +17,24 @@ Candidate = dict[str, Any]
 #   model: str          resolved model id
 #   attempt: int        1-based; retries produce new entries (latest wins)
 #   status: str         gate_passed | gate_failed | patch_failed | llm_failed
-#                       | visual_failed | skipped
+#                       | visual_failed | visual_unverifiable | skipped
 #                       (visual_failed = passed the deterministic gate but failed
 #                       the visual/runtime assertions; treated as not-green so the
-#                       dispatch retry branch reruns it — no empty-Send livelock)
+#                       dispatch retry branch reruns it — no empty-Send livelock.
+#                       visual_unverifiable = the scene verdict could not OBSERVE a
+#                       criterion (startup/transition/one-shot state a read-only
+#                       verifier attaching to a running app cannot reach). Also not
+#                       green, but retrying cannot help, so it routes straight to
+#                       finalize as needs_human.)
 #   worktree: str       path
 #   branch: str         git branch
 #   diff: str           unified diff vs feature branch (on gate_passed)
 #   gate_log: str       failure tail (on gate_failed)
 #   error: str          patch/llm error text
+#   no_patch: bool      set when the response contained NO <file>/<edit> blocks at
+#                       all (prose, a question, a summary). Nothing was attempted,
+#                       so engine/graph.unproductive_attempts refunds the fix round
+#                       — bounded by run.max_unproductive_attempts.
 #   notes: str          worker's own plan/notes
 #   visual_facts: dict  measured scene facts from an ENFORCED visual gate pass
 #                       (absent when the gate is off, skipped, or produced none).
@@ -86,10 +95,13 @@ class TaskState(TypedDict, total=False):
     to_run: list[str]     # candidate ids to (re)run this attempt
     feedback: str         # gate/review notes injected into the next attempt
     escalated: bool       # set once when a task hands off to the subscription senior
+    escalated_attempt: int  # the attempt the senior started on; bounds its retries
+                            # (run.senior_fix_rounds) without touching retry_ceiling
     candidates: Annotated[list[Candidate], add_candidates]
     verdict: dict         # {"decision", "winner", "notes"}
     integration: dict     # {"merged_commit"}
-    outcome: str          # done | failed | rejected
+    outcome: str          # done | failed | rejected | needs_human
+    blocked_reason: str   # why a non-done outcome needs a human, for the backlog note
 
 
 def latest_candidates(state: TaskState) -> dict[str, Candidate]:

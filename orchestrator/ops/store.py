@@ -245,6 +245,30 @@ class Store:
             kinds).fetchall()
         return {r["kind"]: r["n"] for r in rows}
 
+    def run_token_totals(self, run_id: str) -> dict:
+        """Token totals for ONE run, split cash vs subscription.
+
+        `cash spend this run: $0.02` is true and nearly useless: with
+        budget.count_cli false (the default) the subscription tiers are logged but
+        not counted, and on a measured run they were 99.2 % of the notional cost
+        and 92 % of the input tokens. Reporting needs the token figures
+        INDEPENDENTLY of whether the budget counts them — on a subscription plan
+        the input-token total is the resource that actually runs out.
+        """
+        rows = self._conn.execute(
+            """SELECT cash, COUNT(*) calls, COALESCE(SUM(input_tokens),0) in_tok,
+                      COALESCE(SUM(output_tokens),0) out_tok,
+                      COALESCE(SUM(cache_hit_tokens),0) cache_hit,
+                      COALESCE(SUM(cache_miss_tokens),0) cache_miss,
+                      COALESCE(SUM(cost_usd),0) cost
+               FROM usage WHERE run_id=? GROUP BY cash""", (run_id,)).fetchall()
+        out = {"cash": None, "subscription": None}
+        for r in rows:
+            out["cash" if r["cash"] else "subscription"] = {
+                k: r[k] for k in ("calls", "in_tok", "out_tok", "cache_hit",
+                                  "cache_miss", "cost")}
+        return out
+
     def subscription_tokens_by_role(self) -> list[dict]:
         """Subscription-tier (cash=0) token totals per role — the quota proxy.
         Divided by completed tasks, this is the number that decides whether the

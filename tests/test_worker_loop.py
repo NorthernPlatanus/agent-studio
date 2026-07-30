@@ -157,6 +157,66 @@ async def test_retrieval_exhaustion_forces_final_and_logs(tmp_path, monkeypatch)
     assert "retrieval_exhausted" in kinds
 
 
+# ---- prose instead of a patch (defect-plan #2 item 6) -----------------------
+
+async def test_a_prose_reply_is_flagged_so_the_fix_round_is_refunded(tmp_path, monkeypatch):
+    """Observed twice in a row after a review `revise`: 831 then 1,241 output
+    tokens of something that was not a patch, two of four fix rounds gone, an
+    escalation forced — having attempted nothing."""
+    ctx, store = _ctx(tmp_path)
+    provider = ScriptedProvider(
+        ["Good catch. I would start by extracting the pose writer, then..."])
+    out = await _run(ctx, provider, monkeypatch)
+    cand = out["candidates"][0]
+    assert cand["status"] == "patch_failed"
+    assert cand["no_patch"] is True             # graph.unproductive_attempts reads this
+    assert "no <file>/<edit> blocks" in cand["error"]
+    # its own event kind, so `metrics` can show a model that keeps doing this
+    assert any(k == "no_patch" for k, _ in store.events)
+
+
+async def test_a_failed_patch_that_DID_produce_blocks_is_not_refunded(tmp_path, monkeypatch):
+    """Writing outside the allowlist is a real attempt that failed. Only an empty
+    response is free, or every rejected patch would stop costing a round."""
+    ctx, _ = _ctx(tmp_path)
+    provider = ScriptedProvider(['<file path="not-allowed.txt">\nx\n</file>'])
+    out = await _run(ctx, provider, monkeypatch)
+    cand = out["candidates"][0]
+    assert cand["status"] == "patch_failed"
+    assert cand.get("no_patch") is not True
+
+
+async def test_retry_feedback_restates_the_output_contract(tmp_path, monkeypatch):
+    """The hypothesis this fixes: the feedback turn arrives thousands of tokens
+    after the contract in the frozen prefix and reads as a discussion prompt, so
+    the model answers in kind."""
+    ctx, _ = _ctx(tmp_path)
+    provider = ScriptedProvider(['<file path="a.txt">\nfixed\n</file>'])
+    monkeypatch.setattr(worker_mod, "get_provider", lambda cfg, name: provider)
+    out = await worker_mod.run_candidate(ctx, {
+        "run_id": "r", "task_id": "T-1", "spec": _spec(), "cand_id": "w",
+        "attempt": 2, "feedback": "REVIEW NOTES:\nassert the collapsed form",
+        "messages": [{"role": "user", "content": "FROZEN PREFIX"}]})
+    assert out["candidates"][0]["status"] == "gate_passed"
+    turn = [m for m in provider.last_messages if m["role"] == "user"][-1]["content"]
+    assert "assert the collapsed form" in turn        # the actual instruction
+    assert "<file>" in turn and "<edit>" in turn      # ...and the contract
+    assert "no prose" in turn.lower()
+    assert "<grep>" in turn                           # the one legal alternative
+    # The frozen prefix is untouched — the contract arrives as a later turn.
+    assert provider.last_messages[0]["content"] == "FROZEN PREFIX"
+
+
+async def test_the_first_attempt_gets_no_retry_contract(tmp_path, monkeypatch):
+    """Attempt 1 has no feedback, so nothing may be appended after the prefix —
+    that block IS the cache key for the whole warm chain."""
+    ctx, _ = _ctx(tmp_path)
+    provider = ScriptedProvider(['<file path="a.txt">\nx\n</file>'])
+    await _run(ctx, provider, monkeypatch)
+    assert len(provider.last_messages) == 2           # prefix + the assistant reply
+    assert "OUTPUT CONTRACT" not in provider.last_messages[0]["content"]
+
+
 async def test_worker_refuses_spec_without_files_write(tmp_path, monkeypatch):
     """Belt for specs planned before persist_specs validated files_write: an
     absent allowlist must fail closed, before any tokens are spent."""

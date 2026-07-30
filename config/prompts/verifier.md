@@ -55,6 +55,7 @@ Reply with ONE JSON object and nothing else:
 {
   "ok": true,
   "findings": ["short, specific, each tied to a measured value"],
+  "unverifiable": ["criterion you could not observe at all, and why"],
   "facts": {"whatever you measured that a human would want recorded": 0}
 }
 ```
@@ -62,6 +63,15 @@ Reply with ONE JSON object and nothing else:
 - `ok: true` only when every acceptance criterion you could check actually
   checked out. Unverifiable ≠ verified: if you could not check a criterion, set
   `ok: false` and say which one and why.
+- **`unverifiable` is the important distinction.** Put a criterion there when no
+  tool you have can observe it — not when you measured it and it was wrong.
+  You attach to an app that is **already running** and you cannot reload or
+  remount it, so anything about the first rendered frame, a startup transient, a
+  transition, or a one-shot event is out of reach however many times this runs.
+  Saying so ends the task and sends those criteria to a human; leaving
+  `unverifiable` empty means "retry might help", and each retry costs another
+  full inspection. Report everything you *could* confirm in `findings` either
+  way — that is the evidence the human will work from.
 - `findings` explains the verdict either way. On a pass, note what you confirmed
   and anything a human should still look at. On a failure, state what you
   measured and what you expected.

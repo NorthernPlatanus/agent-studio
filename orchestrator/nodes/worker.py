@@ -26,6 +26,23 @@ from ..core.state import Candidate
 
 log = logging.getLogger("orchestrator.worker")
 
+# Appended to every retry-feedback turn. Observed failure: a worker answered a
+# `revise` with 831 and then 1,241 output tokens of prose — two attempts, two
+# `patch_failed: worker returned no <file>/<edit> blocks`, two fix rounds gone and
+# an escalation forced, having attempted nothing. The feedback turn reads as a
+# discussion prompt ("here are the review notes"), several thousand tokens after
+# the output contract in the frozen prefix, so the model answers in kind. Restate
+# the contract where the instruction is, and name the one legal alternative to a
+# patch so a genuinely blocked worker has somewhere to go besides prose.
+RETRY_CONTRACT = """
+
+## OUTPUT CONTRACT — unchanged, and it applies to this turn
+Reply with the patch: `<file>` and/or `<edit>` blocks that implement the fix
+above. No prose, no questions, no summary of what you would do — a reply without
+blocks changes nothing and is thrown away. If you truly cannot patch without
+seeing more code, reply with `<grep>`/`<read>`/`<ls>` requests ONLY and you will
+get the results back, then patch on the next turn."""
+
 
 def _read_task_file(ctx: RunContext, worktree: Path, rel: str) -> str | None:
     """Code comes from the candidate worktree (branch state); paths under
@@ -195,8 +212,10 @@ async def run_candidate(ctx: RunContext, payload: dict) -> dict:
             # prior-failure log as feedback, and an `elif` here would silently drop
             # that context. On attempt 1 `feedback` is always "" (no-op); on
             # retries `messages` is non-empty and this appends as before.
-            messages.append({"role": "user",
-                             "content": f"## RETRY FEEDBACK — fix exactly this\n{feedback}"})
+            messages.append({
+                "role": "user",
+                "content": f"## RETRY FEEDBACK — fix exactly this\n{feedback}"
+                           + RETRY_CONTRACT})
 
         run = ctx.cfg.run
         # retrieval_rounds supersedes the legacy need_files_rounds (kept as fallback).
@@ -264,6 +283,11 @@ async def run_candidate(ctx: RunContext, payload: dict) -> dict:
         # Require an actual patch. A retrieval-only response (even after the
         # forced final attempt) has no touched_paths and must never be applied.
         if not parsed.touched_paths:
+            # Flag it BEFORE raising: the except block returns this same dict, and
+            # `no_patch` is what tells the router nothing was attempted, so the fix
+            # round is refunded rather than spent on prose (bounded by
+            # run.max_unproductive_attempts — see graph.unproductive_attempts).
+            cand["no_patch"] = True
             raise PatchError("worker returned no <file>/<edit> blocks")
 
         cand["notes"] = parsed.plan[:2000]
@@ -326,3 +350,10 @@ def _log_candidate_failure(ctx, task_id: str, cand_id: str, attempt: int,
                 task_id, cand_id, attempt, cand["status"], reason)
     ctx.store.log_event(ctx.run_id, task_id, "candidate_failed",
                         f"{cand_id} attempt={attempt} {cand['status']}: {reason}")
+    if cand.get("no_patch"):
+        # Its own kind so `metrics` can count it: a rising no_patch count means the
+        # cheap tier is answering instructions conversationally, which is a prompt
+        # problem, not a capability one — and the refunded fix rounds hide it from
+        # the retry/escalation numbers.
+        ctx.store.log_event(ctx.run_id, task_id, "no_patch",
+                            f"{cand_id} attempt={attempt} (no blocks; fix round refunded)")

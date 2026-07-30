@@ -54,6 +54,83 @@ def test_string_findings_are_normalized_to_a_list():
     assert v["findings"] == ["one thing"]
 
 
+# ---- unverifiable: a structural dead end, not a defect -----------------------
+
+def test_unverifiable_criteria_are_parsed_separately_from_findings():
+    """"I measured this and it is wrong" and "no tool I have can observe this" are
+    both `ok: false`, but only the first is worth another ~400k-token attempt."""
+    v = verifier.parse_verdict(
+        '{"ok": false, "findings": ["settled pose is exact"],'
+        ' "unverifiable": ["frame 1 — cannot reload the running app"]}')
+    assert v["ok"] is False
+    assert v["unverifiable"] == ["frame 1 — cannot reload the running app"]
+    assert v["findings"] == ["settled pose is exact"]
+
+
+def test_an_ok_verdict_with_an_unmeasured_criterion_fails_closed():
+    """Self-contradictory: the prompt is explicit that unverifiable is not
+    verified. Merging on the optimistic half of that would be the worst outcome."""
+    v = verifier.parse_verdict('{"ok": true, "findings": [], '
+                               '"unverifiable": ["startup transient"]}')
+    assert v["ok"] is False
+
+
+def test_a_clean_verdict_has_no_unverifiable_criteria():
+    v = verifier.parse_verdict('{"ok": true, "findings": []}')
+    assert v["unverifiable"] == [] and v["ok"] is True
+
+
+def test_string_unverifiable_is_normalized():
+    v = verifier.parse_verdict('{"ok": false, "unverifiable": "frame 1"}')
+    assert v["unverifiable"] == ["frame 1"]
+
+
+def test_unverifiable_verdict_ends_the_task_for_a_human():
+    from orchestrator.engine.graph import apply_scene_verdict
+
+    cand = {"cand_id": "w", "attempt": 1, "status": "gate_passed", "diff": "d"}
+    update = apply_scene_verdict(cand, {
+        "ok": False, "findings": ["settled pose exact"],
+        "unverifiable": ["the first rendered frame"]})
+    nc = update["candidates"][0]
+    assert nc["status"] == "visual_unverifiable"
+    assert "UNVERIFIABLE" in nc["gate_log"]
+    assert "settled pose exact" in nc["gate_log"]     # keep what WAS confirmed
+    assert update["outcome"] == "needs_human"
+    assert "the first rendered frame" in update["blocked_reason"]
+
+
+def test_a_measured_rejection_still_rejoins_the_retry_ladder():
+    from orchestrator.engine.graph import apply_scene_verdict
+
+    cand = {"cand_id": "w", "attempt": 1, "status": "gate_passed"}
+    update = apply_scene_verdict(cand, {"ok": False, "findings": ["light is black"]})
+    assert update["candidates"][0]["status"] == "visual_failed"
+    assert "outcome" not in update                    # the ladder decides, not this
+
+
+def test_a_pass_carries_measured_facts_onto_the_candidate():
+    from orchestrator.engine.graph import apply_scene_verdict
+
+    cand = {"cand_id": "w", "attempt": 1, "status": "gate_passed",
+            "visual_facts": {"fromGate": 1}}
+    update = apply_scene_verdict(cand, {"ok": True, "findings": [],
+                                        "facts": {"fov": 50}})
+    nc = update["candidates"][0]
+    assert nc["status"] == "gate_passed"
+    assert nc["visual_facts"] == {"fromGate": 1, "fov": 50}
+
+
+def test_unverifiable_candidate_routes_straight_to_finalize():
+    """Retrying buys another full inspection with the same answer — the loop the
+    scene verdict burned ~797k subscription tokens in."""
+    cfg = _cfg()
+    state = {"attempt": 1, "spec": {"visual": True},
+             "candidates": [{"cand_id": "w", "attempt": 1,
+                             "status": "visual_unverifiable"}]}
+    assert decide_after_verify(cfg, state) == "finalize"    # despite retries left
+
+
 # ---- gating ------------------------------------------------------------------
 
 def _cfg(**over):
@@ -306,3 +383,90 @@ async def test_inspector_lock_serializes_the_phase():
 async def test_inspector_lock_is_one_object_per_context():
     ctx = RunContext(cfg=_cfg(), store=None, git=None, budget=None, run_id="r")
     assert ctx.inspector_lock is ctx.inspector_lock
+
+
+# ---- best-of-N: only the winner is inspected, so only the winner may decide ---
+
+def _boN(winner_status, loser_status="gate_passed", **extra):
+    """Two green candidates, `a` selected by review, `a` then carrying whatever
+    the scene verdict made of it. `b` was never inspected — one verdict per task
+    is what makes the phase affordable — and review never demotes it."""
+    return {"attempt": 1, "spec": {"visual": True},
+            "verdict": {"decision": "approve", "winner": "a"},
+            "candidates": [
+                {"cand_id": "a", "attempt": 1, "status": "gate_passed"},
+                {"cand_id": "b", "attempt": 1, "status": loser_status},
+                {"cand_id": "a", "attempt": 1, "status": winner_status}],
+            **extra}
+
+
+def test_an_unverifiable_winner_ends_the_task_even_with_a_green_sibling():
+    """`any(gate_passed)` saw the never-inspected loser and called it a pass, so
+    the task went to integrate — which merges latest[winner], i.e. the candidate
+    the verdict could not observe — and overwrote needs_human with done."""
+    state = _boN("visual_unverifiable", outcome="needs_human")
+    assert decide_after_verify(_cfg(), state) == "finalize"
+
+
+def test_a_rejected_winner_does_not_integrate_because_a_sibling_is_green():
+    """Same hole, the measured half: the winner was inspected and found wrong,
+    and its diff is the one integrate would merge."""
+    state = _boN("visual_failed")
+    assert decide_after_verify(_cfg(), state) == "dispatch"     # retries left
+
+
+def test_a_verified_winner_still_integrates_at_best_of_n():
+    assert decide_after_verify(_cfg(), _boN("gate_passed")) == "integrate"
+
+
+def test_a_red_sibling_never_blocks_a_verified_winner():
+    """The converse: routing on the winner must not let a losing candidate's
+    failure hold back a winner the verifier confirmed."""
+    state = _boN("gate_passed", loser_status="gate_failed")
+    assert decide_after_verify(_cfg(), state) == "integrate"
+
+
+def test_single_candidate_routing_is_unchanged():
+    for status, expected in (("gate_passed", "integrate"),
+                             ("visual_unverifiable", "finalize"),
+                             ("visual_failed", "dispatch")):
+        state = {"attempt": 1, "spec": {"visual": True},
+                 "verdict": {"decision": "approve", "winner": "a"},
+                 "candidates": [{"cand_id": "a", "attempt": 1, "status": status}]}
+        assert decide_after_verify(_cfg(), state) == expected
+
+
+# ---- what the human backlog is told about a scene rejection -------------------
+
+def test_a_rejected_scene_records_why_for_the_backlog():
+    """`finalize` writes `blocked_reason` to the board. Without one, a task that
+    exhausted its retries after a scene rejection wrote `agent run failed — needs
+    human`, and the measured findings lived only in the gate log and the event
+    table — nowhere the human looks."""
+    from orchestrator.engine.graph import apply_scene_verdict
+
+    update = apply_scene_verdict(
+        {"cand_id": "a", "attempt": 1, "status": "gate_passed"},
+        {"ok": False, "findings": ["ground plane renders black", "fps 4"]})
+    assert update["candidates"][0]["status"] == "visual_failed"
+    assert update["blocked_reason"] == ("scene verdict rejected: ground plane "
+                                        "renders black; fps 4")
+
+
+def test_the_reason_is_cleared_when_the_next_attempt_starts():
+    """It describes a judgment about one attempt. Left standing, the previous
+    round's scene findings would end up on the backlog next to an unrelated later
+    failure."""
+    from orchestrator.core.config import Config as _C
+    from orchestrator.engine.graph import plan_dispatch
+
+    cfg = _C({"run": {"n_candidates": 1, "max_retries": 3,
+                      "escalate_on_exhaustion": False,
+                      "senior_first_for_high_risk": False},
+              "roles": {"worker": {"default": "cheap", "candidates": ["cheap"]}},
+              "gate": {"log_tail_chars": 500}, "domains": {}}, "p", Path("/tmp"))
+    state = {"attempt": 1, "spec": {"id": "T-1"},
+             "blocked_reason": "scene verdict rejected: ground plane renders black",
+             "candidates": [{"cand_id": "cheap", "attempt": 1,
+                             "status": "visual_failed", "gate_log": "L"}]}
+    assert plan_dispatch(cfg, state)["blocked_reason"] == ""

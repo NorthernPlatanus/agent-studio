@@ -97,6 +97,11 @@ def parse_verdict(text: str) -> dict:
     An unparseable verdict is a failed verification, never a pass: the whole
     point of this phase is to catch what assertions miss, and "the verifier
     returned prose" is not evidence that the scene is right.
+
+    `unverifiable` separates "I measured this and it is wrong" from "this cannot
+    be observed with the tools I have". Both are `ok: false` — unverifiable is
+    never verified — but only the first is worth another attempt. See
+    graph.verify_node for what the second one does instead.
     """
     m = VERDICT_RE.search(text or "")
     if not m:
@@ -113,7 +118,16 @@ def parse_verdict(text: str) -> dict:
     findings = data.get("findings") or []
     if isinstance(findings, str):
         findings = [findings]
-    return {"ok": bool(data["ok"]), "findings": [str(f) for f in findings][:20],
+    unverifiable = data.get("unverifiable") or []
+    if isinstance(unverifiable, str):
+        unverifiable = [unverifiable]
+    unverifiable = [str(u) for u in unverifiable][:20]
+    return {# An `ok: true` alongside an unmeasured criterion is self-contradictory
+            # (the prompt is explicit: unverifiable is not verified). Fail closed on
+            # the contradiction rather than merging on the optimistic half of it.
+            "ok": bool(data["ok"]) and not unverifiable,
+            "findings": [str(f) for f in findings][:20],
+            "unverifiable": unverifiable,
             "facts": data.get("facts") if isinstance(data.get("facts"), dict) else None}
 
 

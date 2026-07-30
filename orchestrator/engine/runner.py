@@ -70,6 +70,41 @@ def _plan_only(ctx: RunContext, task_filter: set[str] | None) -> None:
     print("\nno tokens spent, no git mutations. Remove --dry-run to execute.\n")
 
 
+def format_run_tokens(totals: dict) -> list[str]:
+    """One line per billing channel for the run summary.
+
+    The summary used to print `cash spend this run: $0.02` and nothing else, which
+    on a measured run described 0.8 % of what the run consumed: the subscription
+    tiers (planner, reviewer, scene verdict) are logged but not counted, and they
+    were 92 % of the input tokens. The ledger already has every field — this only
+    prints it, independently of budget.count_cli.
+    """
+    lines = []
+    for channel in ("subscription", "cash"):
+        row = totals.get(channel)
+        if not row or not row["calls"]:
+            continue
+        hit, miss = row["cache_hit"], row["cache_miss"]
+        # "-" rather than 0% when the provider reports no cache telemetry at all,
+        # so an unknown never reads as a measured cold cache (same rule as `status`).
+        cached = f"{hit / (hit + miss) * 100:.0f}% cached" if (hit + miss) else \
+            "cache unreported"
+        cost = row["cost"] or 0.0
+        # Subscription cost is notional (quota, not money); cash is real. And cash
+        # on the cheap tier is genuinely sub-cent — $0.00 would hide the whole
+        # number that makes the two-tier split worth having.
+        money = ("notional " if channel == "subscription" else "billed ") + \
+            (f"${cost:.2f}" if cost >= 0.01 else f"${cost:.4f}")
+        lines.append(f"{channel}: {row['in_tok']:,} in ({cached}) / "
+                     f"{row['out_tok']:,} out across {row['calls']} calls   {money}")
+    return lines
+
+
+def _print_run_tokens(store: Store, run_id: str) -> None:
+    for line in format_run_tokens(store.run_token_totals(run_id)):
+        print(line)
+
+
 def _filtered(ctx: RunContext, task_filter: set[str] | None) -> list[dict]:
     tasks = ctx.store.all_tasks()
     if task_filter:
@@ -164,6 +199,7 @@ async def run(cfg: Config, *, dry_run: bool = False,
             store.set_run_status(run_id, "done")
             stats = queue_stats(store.all_tasks())
             print(f"\nrun {run_id} complete. queue: {stats}")
+            _print_run_tokens(store, run_id)
             print(f"cash spend this run: ${store.run_cash_spend(run_id):.2f}")
 
         except LimitExhausted as e:
@@ -180,6 +216,7 @@ async def run(cfg: Config, *, dry_run: bool = False,
                           degraded=True)
                 return
             store.set_run_status(run_id, "paused", note=f"limit: {e}")
+            _print_run_tokens(store, run_id)
             print(f"\n⏸  Claude Code limit exhausted — run checkpointed.\n"
                   f"   {e}\n"
                   f"   When your limit resets:  python -m orchestrator resume "
@@ -187,6 +224,7 @@ async def run(cfg: Config, *, dry_run: bool = False,
 
         except BudgetExceeded as e:
             store.set_run_status(run_id, "paused", note=f"budget: {e}")
+            _print_run_tokens(store, run_id)
             print(f"\n⏸  Budget cap hit — run checkpointed.\n   {e}\n"
                   f"   Raise budget.* in config and resume:  "
                   f"python -m orchestrator resume --project {cfg.project_name}")

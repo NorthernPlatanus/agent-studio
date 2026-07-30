@@ -21,7 +21,8 @@ from .engine import runner
 from .core.config import load_config
 from .core.errors import PlannerNeedsInput
 from .nodes.discuss import run_discuss
-from .nodes.planner import import_backlog_stubs, plan
+from .nodes.planner import (import_backlog_stubs, needs_plan_ids as plan_batch_ids,
+                            plan)
 from .engine.scheduler import queue_stats
 from .ops.store import Store
 
@@ -50,6 +51,18 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("note", nargs="?", default="",
                    help="optional discussion note to fold into the plan")
     p.add_argument("--tasks", help="comma-separated ids to (re)plan, e.g. T-120,T-121")
+    # Batching is the single largest saving available with no code change: the
+    # planner's cost is ~400k tokens of repo exploration per INVOCATION, amortised
+    # across everything in the call (measured: 385k for one task, 425k for one item
+    # split into two). Planning one item at a time is the most expensive way to use
+    # this harness, so make the cheap path the easy one.
+    p.add_argument("--all-needs-plan", action="store_true",
+                   help="plan every needs_plan task in ONE call (~8-9x cheaper per "
+                        "task than planning them one at a time)")
+    p.add_argument("--limit", type=int, default=None,
+                   help="with --all-needs-plan: cap how many items go into the call "
+                        "(specs written far ahead of the work go stale — batch per "
+                        "milestone, not the whole backlog). 0 or omitted = no cap")
 
     p = sub.add_parser("discuss", help="interactive multi-turn requirements loop (tech-lead planner)")
     _add_common(p)
@@ -93,7 +106,8 @@ def _print_metrics(store) -> None:
 
     counts = store.event_counts(("escalated", "auto_integrated", "crashed",
                                  "retrieval_exhausted", "visual_gate_error",
-                                 "visual_gate_skipped"))
+                                 "visual_gate_skipped", "no_patch",
+                                 "verify_unverifiable"))
     print(f"\nqueue: {queue_stats(tasks)}")
     for kind in sorted(counts):
         print(f"  {kind:<22} {counts[kind]}")
@@ -119,6 +133,16 @@ def main(argv: list[str] | None = None) -> int:
         run_id = store.create_run(note="plan")
         ctx = runner.make_context(cfg, store, run_id)
         only = set(args.tasks.split(",")) if args.tasks else None
+        if args.all_needs_plan:
+            pending = plan_batch_ids(store, args.limit)
+            if not pending:
+                print("nothing to plan: no tasks with status needs_plan "
+                      "(run `import-backlog` first?)")
+                store.set_run_status(run_id, "done")
+                return 0
+            only = (only or set()) | set(pending)
+            print(f"planning {len(only)} item{'s' if len(only) != 1 else ''} in "
+                  f"one call: {', '.join(sorted(only))}")
         try:
             specs = asyncio.run(plan(ctx, args.note, sorted(only) if only else None))
         except PlannerNeedsInput as e:

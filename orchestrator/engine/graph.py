@@ -46,10 +46,47 @@ from ..core.state import TaskState, latest_candidates
 log = logging.getLogger("orchestrator.graph")
 
 
-def escalation_ready(cfg, state: TaskState, latest: dict, finished_attempt: int) -> bool:
-    """True when the cheap warm loop has exhausted max_fix_rounds without a green
-    gate and we haven't escalated yet. Escalation is a dispatch policy branch (not
-    a new node), so Send objects still originate only in fan_out. Pure."""
+def is_stuck(state: TaskState, latest: dict) -> bool:
+    """What "the cheap loop is getting nowhere" means — defined ONCE.
+
+    Three shapes, each observed as a live failure before it was counted:
+
+      * **nothing is green.** The original definition, and still the common case.
+      * **green gate, repeated `revise`.** A candidate the reviewer keeps sending
+        back is just as stuck; demanding a red gate here meant
+        `escalate_on_exhaustion` could never fire on a review failure, and
+        gate-green/spec-incomplete code finalized `failed` at max_fix_rounds with
+        the ladder configured the whole time.
+      * **green gate, scene verdict rejected the winner.** Only the winner is
+        inspected — one verdict per task is what makes the phase affordable — so
+        at best-of-N a never-inspected loser is still `gate_passed` and the
+        `not any(green)` test read the task as healthy. Same stale green that let
+        a rejected winner get merged; it also kept the senior out of exactly the
+        tasks it exists for.
+
+    Both callers (`escalation_ready`'s default and `plan_dispatch`'s escalation
+    branch) go through here. They MUST agree: a router that says "dispatch,
+    escalating" while dispatch quietly takes the ordinary retry branch is how the
+    ladder went silent the first time."""
+    verdict = state.get("verdict") or {}
+    if verdict.get("decision") == "revise":
+        return True
+    winner = latest.get(verdict.get("winner"))
+    if winner is not None and winner["status"] in ("visual_failed",
+                                                   "visual_unverifiable"):
+        return True
+    return not any(c["status"] == "gate_passed" for c in latest.values())
+
+
+def escalation_ready(cfg, state: TaskState, latest: dict, finished_attempt: int,
+                     *, stuck: bool | None = None) -> bool:
+    """True when the cheap warm loop has exhausted max_fix_rounds without getting
+    anywhere and we haven't escalated yet. Escalation is a dispatch policy branch
+    (not a new node), so Send objects still originate only in fan_out. Pure.
+
+    `stuck` is what "getting nowhere" means; leave it None and `is_stuck` decides,
+    which is what every caller in the graph does. An explicit override exists only
+    for callers that already know the answer (and for tests)."""
     run = cfg.run
     if not bool(run.get("escalate_on_exhaustion", False)):
         return False
@@ -57,9 +94,81 @@ def escalation_ready(cfg, state: TaskState, latest: dict, finished_attempt: int)
         return False
     if not latest:  # nothing has run yet
         return False
-    green = any(c["status"] == "gate_passed" for c in latest.values())
+    if stuck is None:
+        stuck = is_stuck(state, latest)
     max_fix = int(run.get("max_fix_rounds", run.get("max_retries", 3)))
-    return (not green) and finished_attempt >= max_fix
+    return bool(stuck) and finished_attempt >= max_fix
+
+
+def senior_rounds_left(cfg, state: TaskState) -> bool:
+    """True when the escalated senior may have another attempt.
+
+    The senior used to get exactly one shot (`escalated` -> finalize on the next
+    red result). Defensible in principle, but observed dying on a trivial missing
+    import — the most expensive tier getting the fewest chances, on the task the
+    cheap tier already failed. `run.senior_fix_rounds` (default 1) buys it that
+    many RETRIES, each warmed with the gate log through the ordinary retry branch.
+
+    Bounded independently of `retry_ceiling`: the senior's first attempt sits
+    above that ceiling by construction (escalation fires AT the ceiling), so
+    reusing it here would allow zero retries however this is configured.
+
+    Rounds spent are counted the same way `attempts_used` counts them — an
+    attempt in which the senior returned prose instead of `<file>`/`<edit>`
+    blocks attempted nothing and is refunded. Measuring the RAW attempt here
+    meant the most expensive tier could burn its whole allowance on two
+    conversational replies without ever emitting a patch, while the cheap tier
+    was forgiven exactly that (run.max_unproductive_attempts, which also caps
+    this, so a permanently chatty senior still terminates)."""
+    rounds = int(cfg.run.get("senior_fix_rounds", 1))
+    if rounds <= 0:
+        return False
+    first = int(state.get("escalated_attempt") or 0)
+    if not first:
+        # No escalation attempt recorded (a checkpoint written before this field
+        # existed, or senior_first, which deliberately skips the once-guard).
+        # Fall back to the old one-shot behavior rather than guessing.
+        return False
+    spent = int(state.get("attempt", first)) - first
+    return (spent - unproductive_attempts(cfg, state, since=first)) < rounds
+
+
+def unproductive_attempts(cfg, state: TaskState, since: int = 0) -> int:
+    """Attempts in which EVERY dispatched candidate produced no patch at all,
+    capped by `run.max_unproductive_attempts`.
+
+    A worker that answers a `revise` with prose instead of `<file>`/`<edit>`
+    blocks has not attempted the fix (observed twice in a row on the review
+    path), so charging it a fix round spends the ladder on nothing and forces a
+    premature escalation. Those attempts are forgiven here — but only up to the
+    cap, because a model that ALWAYS replies conversationally would otherwise
+    retry forever, and an unbounded loop is worse than a wasted round.
+
+    A mixed attempt (one candidate patched, another rambled) is productive: the
+    ceiling counts rounds of work, and work happened.
+
+    `since` restricts the count to attempts >= that number, for a ceiling that
+    starts mid-task: `senior_rounds_left` must forgive the SENIOR's prose without
+    also handing it the cheap tier's refunds, which `attempts_used` already
+    spent. The cap applies to whatever window is asked for, so each ceiling is
+    bounded on its own."""
+    cap = int(cfg.run.get("max_unproductive_attempts", 2))
+    if cap <= 0:
+        return 0
+    by_attempt: dict[int, list] = {}
+    for cand in state.get("candidates", []):
+        if cand["attempt"] < since:
+            continue
+        by_attempt.setdefault(cand["attempt"], []).append(cand)
+    free = sum(1 for cands in by_attempt.values()
+               if cands and all(c.get("no_patch") for c in cands))
+    return min(free, cap)
+
+
+def attempts_used(cfg, state: TaskState) -> int:
+    """The attempt count every retry ceiling is measured against: attempts made,
+    minus the (bounded) ones where nothing was actually attempted."""
+    return max(0, int(state.get("attempt", 0)) - unproductive_attempts(cfg, state))
 
 
 def resolve_worker_pool(cfg, spec: dict | None) -> tuple[str, list[str]]:
@@ -128,7 +237,10 @@ def plan_dispatch(cfg, state: TaskState) -> dict:
     attempt = state.get("attempt", 0) + 1
     latest = latest_candidates(state)
     verdict = state.get("verdict") or {}
-    update: dict = {"attempt": attempt, "verdict": {}}
+    # `blocked_reason` is cleared with the verdict: both describe a judgment about
+    # the attempt that just finished, and a stale one would put the previous
+    # round's scene findings on the backlog next to an unrelated later failure.
+    update: dict = {"attempt": attempt, "verdict": {}, "blocked_reason": ""}
 
     def _logs(cands: dict) -> str:
         return "\n\n".join(
@@ -147,14 +259,25 @@ def plan_dispatch(cfg, state: TaskState) -> dict:
             default, pool = resolve_worker_pool(cfg, spec)
             update["to_run"] = [default] if n <= 1 else (pool or [default])[:n]
             update["feedback"] = ""
-    elif escalation_ready(cfg, state, latest, attempt - 1):
-        # Rung 3: hand the still-red task to the subscription senior. The senior
+    elif escalation_ready(cfg, state, latest, attempts_used(cfg, state)):
+        # Rung 3: hand the stuck task to the subscription senior. The senior
         # implements via the same patch->gate channel (no repo edits); writes stay
-        # locked to that channel. Set the once-guard here (routers stay pure).
+        # locked to that channel. Set the once-guard here (routers stay pure), plus
+        # the attempt it started on so senior_rounds_left can bound its retries.
         update["to_run"] = ["senior"]
         update["escalated"] = True
-        update["feedback"] = ("ESCALATED to senior — the cheaper workers could not "
-                              "pass the gate. Prior failures:\n" + _logs(latest))
+        update["escalated_attempt"] = attempt
+        if verdict.get("decision") == "revise":
+            # Escalating out of a REVIEW deadlock: the gate is green, so a gate log
+            # would say nothing. What the senior needs is the objection it has to
+            # answer.
+            update["feedback"] = (
+                "ESCALATED to senior — the cheaper workers passed the gate but "
+                "could not satisfy the reviewer. Latest review notes:\n"
+                + str(verdict.get("notes", "")))
+        else:
+            update["feedback"] = ("ESCALATED to senior — the cheaper workers could "
+                                  "not pass the gate. Prior failures:\n" + _logs(latest))
     elif verdict.get("decision") == "revise":
         update["to_run"] = [verdict["winner"]]
         update["feedback"] = f"REVIEW NOTES:\n{verdict.get('notes', '')}"
@@ -165,6 +288,49 @@ def plan_dispatch(cfg, state: TaskState) -> dict:
         update["to_run"] = list(failed)
         update["feedback"] = _logs(failed)
     return update
+
+
+def apply_scene_verdict(cand: dict, verdict: dict) -> dict:
+    """Pure: winning candidate + scene verdict -> the state update. Three outcomes.
+
+    * **ok** — carry any measured facts onto the candidate (still `gate_passed`).
+    * **unverifiable** — the verifier could not OBSERVE a criterion. Structural,
+      not a defect: it attaches to an already-running app with read-only tools, so
+      startup / transition / one-shot state is out of reach by construction and no
+      retry can change that. Observed burning ~797k subscription tokens on two
+      ~400k verdicts about code the reviewer had already approved twice. Ends the
+      task as `needs_human` with the unmeasured criteria named.
+    * **rejected** — measured and wrong. `visual_failed`, i.e. not green, so it
+      rejoins the ordinary retry ladder like any red result.
+    """
+    nc = dict(cand)
+    if verdict["ok"]:
+        if verdict.get("facts"):
+            nc["visual_facts"] = {**(cand.get("visual_facts") or {}),
+                                  **verdict["facts"]}
+        return {"candidates": [nc]}
+    if verdict.get("unverifiable"):
+        unmeasured = "; ".join(verdict["unverifiable"])
+        nc["status"] = "visual_unverifiable"
+        nc["gate_log"] = (
+            "SCENE VERDICT UNVERIFIABLE (the running app cannot show this):\n"
+            + "\n".join(verdict["unverifiable"])
+            + "\n\nAlso reported:\n" + "\n".join(verdict.get("findings") or []))
+        return {"candidates": [nc], "outcome": "needs_human",
+                "blocked_reason": f"scene verdict could not observe: {unmeasured}"[:500]}
+    nc["status"] = "visual_failed"
+    findings = verdict.get("findings") or []
+    nc["gate_log"] = ("SCENE VERDICT REJECTED (inspected the running app):\n"
+                      + "\n".join(findings))
+    # Also record WHY for the human backlog. Without it a task that exhausts its
+    # retries after a scene rejection wrote `agent run failed — needs human` to the
+    # board: the verifier's measured findings survived only in the candidate's
+    # gate_log and the event log, i.e. nowhere the human actually looks. Safe to
+    # set on a non-terminal outcome because `plan_dispatch` clears it when the next
+    # attempt starts, so it always describes the judgment that ended the task.
+    return {"candidates": [nc],
+            "blocked_reason": ("scene verdict rejected: "
+                               + "; ".join(findings))[:500]}
 
 
 def visual_needed(cfg, state: TaskState) -> bool:
@@ -199,10 +365,14 @@ def _decide_when_not_green(cfg, state: TaskState, latest: dict) -> str:
     so they are treated as red here (and picked up by dispatch's retry branch —
     no empty-Send livelock)."""
     if state.get("escalated"):
-        return "finalize"        # the senior already tried and failed -> human
-    if escalation_ready(cfg, state, latest, state["attempt"]):
+        # The senior tried and failed. It gets run.senior_fix_rounds retries (the
+        # ordinary retry branch, warmed with the gate log) before this becomes a
+        # human's problem.
+        return "dispatch" if senior_rounds_left(cfg, state) else "finalize"
+    used = attempts_used(cfg, state)
+    if escalation_ready(cfg, state, latest, used):
         return "dispatch"        # dispatch will take the escalation branch
-    if state["attempt"] < retry_ceiling(cfg):
+    if used < retry_ceiling(cfg):
         return "dispatch"
     return "finalize"
 
@@ -238,18 +408,64 @@ def decide_after_review(cfg, state: TaskState) -> str:
     if decision == "approve":
         return "verify" if verifier.verify_needed(cfg, state.get("spec")) \
             else "integrate"
-    if decision == "revise" and state["attempt"] < retry_ceiling(cfg):
-        return "dispatch"
+    if decision == "revise":
+        if state.get("escalated"):
+            return "dispatch" if senior_rounds_left(cfg, state) else "finalize"
+        used = attempts_used(cfg, state)
+        if used < retry_ceiling(cfg):
+            return "dispatch"
+        # Out of fix rounds on a GREEN gate. Falling through to finalize here is
+        # what made escalate_on_exhaustion unreachable for review failures: the
+        # ladder is for a task the cheap tier cannot finish, and "passes the gate,
+        # never satisfies the reviewer" is that task. `is_stuck` says so (this
+        # decision is not repeated here — dispatch has to reach the same verdict
+        # or the escalation branch is never taken).
+        if escalation_ready(cfg, state, latest_candidates(state), used):
+            return "dispatch"    # dispatch takes the escalation branch
     return "finalize"
 
 
 def decide_after_verify(cfg, state: TaskState) -> str:
     """Router after the scene verdict. A rejected candidate is `visual_failed`,
     i.e. not green, so it rejoins the ordinary retry/escalate/finalize path — the
-    same treatment a failed visual gate gets, and no new machinery."""
+    same treatment a failed visual gate gets, and no new machinery.
+
+    `visual_unverifiable` is the exception: the criterion cannot be observed by a
+    read-only verifier that attaches to a running app, so retrying buys another
+    ~400k-token verdict with the same answer. Straight to finalize (as
+    needs_human), where the human gets the unmeasured criteria.
+
+    Routed on the WINNER's status, not on `any(gate_passed)`. Only the winner is
+    inspected (one verdict per task is what makes this affordable), and review
+    does not demote the candidates it passed over — so at best-of-N a loser sits
+    there still `gate_passed` and an `any` test read it as a pass. The task then
+    went to `integrate`, which merges `latest[verdict["winner"]]`: the very
+    candidate the scene verdict had just rejected or could not observe, with the
+    `needs_human` outcome overwritten by `done` and a "merged" note on the
+    backlog. Reachable with `--n` alone. The unverifiable case ends the task
+    regardless of N — it is the CRITERION that cannot be observed, not the
+    candidate, so no sibling can do better."""
     latest = latest_candidates(state)
-    if any(c["status"] == "gate_passed" for c in latest.values()):
-        return "integrate"
+    winner = latest.get((state.get("verdict") or {}).get("winner"))
+    if winner is not None:
+        if winner["status"] == "gate_passed":
+            return "integrate"
+        if winner["status"] == "visual_unverifiable":
+            return "finalize"
+    else:
+        # No winner on record. `verify` is only reachable through a review
+        # verdict, so this is a checkpoint predating one (or the auto-integrate
+        # shape, which a visual spec never takes). Keep the old whole-set
+        # behavior — there is no better signal — but still treat unverifiable as
+        # terminal, since no retry can observe what no tool can reach.
+        if any(c["status"] == "visual_unverifiable" for c in latest.values()):
+            return "finalize"
+        if any(c["status"] == "gate_passed" for c in latest.values()):
+            return "integrate"
+    # Measured and wrong (or nothing green to inspect): back onto the ordinary
+    # ladder. dispatch's retry branch picks up exactly the non-green candidates,
+    # i.e. this winner, and a green sibling stays available for review to select
+    # next time round.
     return _decide_when_not_green(cfg, state, latest)
 
 
@@ -379,17 +595,15 @@ def build_task_graph(ctx: RunContext):
         ctx.store.log_event(
             ctx.run_id, state["task_id"], "verify",
             f"{winner_id} ok={verdict['ok']} findings={verdict['findings']}"[:2000])
-        if verdict["ok"]:
-            nc = dict(cand)
-            if verdict.get("facts"):
-                nc["visual_facts"] = {**(cand.get("visual_facts") or {}),
-                                      **verdict["facts"]}
-            return {"candidates": [nc]}
-        nc = dict(cand)
-        nc["status"] = "visual_failed"
-        nc["gate_log"] = ("SCENE VERDICT REJECTED (inspected the running app):\n"
-                          + "\n".join(verdict["findings"]))
-        return {"candidates": [nc]}
+        update = apply_scene_verdict(cand, verdict)
+        if update.get("outcome") == "needs_human":
+            unmeasured = "; ".join(verdict["unverifiable"])
+            log.warning("%s verify: %s reported unverifiable criteria — no retry "
+                        "can observe them: %s", state["task_id"], winner_id,
+                        unmeasured)
+            ctx.store.log_event(ctx.run_id, state["task_id"], "verify_unverifiable",
+                                f"{winner_id} {unmeasured}"[:2000])
+        return update
 
     def route_after_verify(state: TaskState) -> str:
         return decide_after_verify(ctx.cfg, state)
