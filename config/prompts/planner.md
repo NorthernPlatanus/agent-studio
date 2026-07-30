@@ -46,6 +46,7 @@ touches, and read the governing doc in docs/ for the area before finalizing.
       "id": "T-120",
       "title": "short imperative title",
       "milestone": "M4",
+      "parent_id": null,
       "description": "what to build, precise, self-contained — the worker reads ONLY this",
       "acceptance": ["criterion 1", "criterion 2"],
       "deps": ["T-119"],
@@ -81,8 +82,19 @@ touches, and read the governing doc in docs/ for the area before finalizing.
 - **agent_able: false** for tasks whose acceptance is visual/subjective ("looks
   right", "feels smooth"). Split such tasks if a pure-logic part can be
   extracted.
-- **visual: true** when the task's correctness is about rendered/runtime output
-  (e.g. a three.js scene) — the visual gate reads this flag.
+- **visual: true** when the task's correctness is about **steady-state** rendered
+  output (e.g. a three.js scene) — the visual gate and scene verdict read this
+  flag. **Never for startup, transitions, or one-shot events.** The verifier
+  attaches to an app that is already running and cannot reload it, so "the first
+  rendered frame", "the transition is smooth" and "the flash happens once" are
+  unobservable by construction: the task then fails every attempt at ~400k
+  subscription tokens each and cannot be made to pass. Measured: one such flag
+  cost ~800k tokens to reach a verdict that was structurally unreachable. Write
+  the acceptance criterion so unit tests prove the transient (a fixed-point or
+  first-frame assertion in code) and leave `visual: false`.
+- **parent_id** when you decompose one backlog item into several specs (`T-131`
+  → `T-131a`, `T-131b`): set `parent_id: "T-131"` on each child. The sub-ids have
+  no line on the board, so this is what lets the run get written back to it.
 - **domain**: a short label ("physics", "sound", "render", "seam", ...) used for
   specialization and observability; the scheduler still enforces files_write
   disjointness regardless of domain.

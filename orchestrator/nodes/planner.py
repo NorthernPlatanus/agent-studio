@@ -13,7 +13,7 @@ import json
 import logging
 import re
 
-from ..ops.backlog import make_backlog
+from ..ops.backlog import make_backlog, parent_id as derive_parent_id
 from ..ops import projectmap
 from ..core.context import RunContext
 from ..core.errors import PlannerNeedsInput, SessionLost
@@ -193,6 +193,14 @@ def persist_specs(ctx: RunContext, specs: list[dict], note: str = "") -> list[di
         # The planner sees current specs (which carry queue status) and may
         # echo the field back — never let LLM output overwrite queue state.
         spec.pop("status", None)
+        # Decomposition bookkeeping: backlog item T-131 planned as T-131a/T-131b.
+        # Neither sub-id has a line on the board, so the integrator's writeback
+        # needs to know which item they belong to or it writes nothing at all
+        # (see ops/backlog.parent_id). Derived only when the planner didn't say.
+        if not spec.get("parent_id"):
+            derived = derive_parent_id(spec["id"])
+            if derived:
+                spec["parent_id"] = derived
         ctx.store.upsert_task(spec)
     ctx.store.log_event(ctx.run_id, None, "planned",
                         f"{len(specs)} specs" + (f" (note: {note[:100]})" if note else ""))
@@ -209,6 +217,25 @@ async def plan(ctx: RunContext, discussion: str = "",
     if env["questions"]:
         raise PlannerNeedsInput(env["questions"], env["assumptions"])
     return persist_specs(ctx, env["specs"], note=discussion)
+
+
+def needs_plan_ids(store, limit: int | None = None) -> list[str]:
+    """Every task still awaiting a spec — the batch for `plan --all-needs-plan`.
+
+    Planner cost scales with the number of `plan` INVOCATIONS, not with the number
+    of tasks planned: the static payload (prompt + project map + backlog + protocol)
+    is only ~17k tokens, and the other ~400k is one agentic Read/Grep/Glob pass over
+    the repo, amortised across everything in the call. Measured 385k for one task
+    and 425k for one item decomposed into two, so planning one at a time is the most
+    expensive way to use this harness.
+
+    `limit` exists because the opposite extreme is also wrong: specs written far
+    ahead of the work go stale as earlier tasks land (a reviewer was observed
+    reasoning about a helper that a sibling task had since merged). Batch per
+    milestone. Ordered by id (store.all_tasks is), so the batch is deterministic.
+    """
+    ids = [t["id"] for t in store.all_tasks() if t["status"] == "needs_plan"]
+    return ids[:limit] if limit and limit > 0 else ids
 
 
 def import_backlog_stubs(ctx: RunContext) -> int:

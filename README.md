@@ -108,6 +108,9 @@ python -m orchestrator import-backlog --project example
 # 2. Enrich into executable specs (the tech-lead planner reads the repo; this is
 #    where files_read/files_write/deps/agent_able/complexity/risk get authored):
 python -m orchestrator plan --project example
+#    Planner cost is per INVOCATION (~400k tokens of repo exploration), not per
+#    task, so plan a milestone's worth in one call — ~8-9x cheaper per task:
+python -m orchestrator plan --project example --all-needs-plan --limit 10
 #    ...or hold a multi-turn requirements conversation (it asks, pushes back,
 #    then persists the plan on your approval):
 python -m orchestrator discuss --project example "add rate limiting to the API layer"
@@ -188,11 +191,20 @@ payload automatically. Off by default — verify `--resume` against your install
 CLI once, then enable.
 
 **Escalation ladder**: the cheap worker iterates on a warm cache up to
-`run.max_fix_rounds`; if it still can't pass the gate and
-`run.escalate_on_exhaustion` is on, the task escalates once to a **subscription
+`run.max_fix_rounds`; if it still can't land the task and
+`run.escalate_on_exhaustion` is on, the task escalates to a **subscription
 senior** (Opus/Sonnet or GPT-5.6) — cash cost $0. The senior implements through
 the same patch→gate channel (it never edits the repo directly), routed as a
-`dispatch` branch so `Send` still originates only from the fan-out.
+`dispatch` branch so `Send` still originates only from the fan-out. "Can't land
+it" covers both shapes of stuck: a red gate, **and** a green gate the reviewer
+keeps sending back with `revise`. It then gets `run.senior_fix_rounds` (default
+1) retries of its own, fed the gate log — the most expensive tier used to get one
+shot and could lose it to a missing import.
+
+An attempt in which every candidate returned no `<file>`/`<edit>` blocks at all
+(prose, a question) is refunded rather than charged against the retry ceiling —
+nothing was attempted. Bounded by `run.max_unproductive_attempts` (default 2) and
+counted as `no_patch` in `metrics`, since a rising count is a prompt problem.
 
 **Risk routing** (opt-in): the planner labels every spec with `risk` and
 `complexity`. `run.auto_integrate_low_risk` merges a green, low-risk,
@@ -219,6 +231,18 @@ back through the normal retry. Enabled with **no** `facts_cmd` configured, the
 gate passes through and logs `visual_gate_skipped` — nothing was asserted, and
 the ledger says so rather than reporting a green visual check.
 
+**Scene verdict** (optional, `verify.enabled`): once per task, on the winning
+candidate, after an approving review — a smart-tier agent drives a read-only
+scene inspector over MCP and answers the question assertions can't ("is anything
+wrong that nobody thought to assert?"). It attaches to the running app and
+**cannot reload it**, so a criterion about the first frame, a transient or a
+one-shot event is unobservable by construction: the verifier reports those as
+`unverifiable` and the task ends as `needs_human` with them named, instead of
+retrying at ~400k subscription tokens per attempt for a verdict it can never
+reach (measured: ~800k spent on one such task). Keep `visual: true` for
+steady-state appearance — the planner prompt says so — and prove transients with
+unit tests.
+
 **Project map**: after each successful merge the integrator regenerates a cheap,
 deterministic structural index (tree + module→symbols) into the gitignored
 `projects/<name>/projectmap.md`, which the planner inserts between the backlog
@@ -228,7 +252,11 @@ and current specs so `files_read` authoring starts from a real skeleton.
 CometAPI spend is checked against `budget.per_task_usd` / `per_run_usd`.
 Subscription CLI usage (claude_cli, and codex_cli with `auth: subscription`)
 is logged, not counted, by default (`budget.count_cli` / per-provider `count`
-to change that; the legacy `count_claude_cli` still works).
+to change that; the legacy `count_claude_cli` still works). Because that default
+means the cash figure describes ~1 % of a run, the run summary prints token
+totals per channel regardless — `subscription: 2,572,277 in (76% cached) /
+106,380 out across 23 calls` — since on a subscription plan the input-token count
+is the resource that actually runs out.
 When the CLI reports limit exhaustion the run **checkpoints and pauses**
 (`run.on_limit_exhausted: pause`); `resume` continues mid-task from the
 LangGraph SQLite checkpoint. Set `degrade` to reroute Opus roles to a cheap
@@ -238,6 +266,12 @@ model instead of pausing.
 truth. `plan` imports/enriches into SQLite (machine truth: deps, files,
 retries, cost); the finalizer writes back — flipping only the checkbox char
 and appending one `**Agent:** ...` note line, never rewriting your text.
+When the planner decomposes one backlog item into several specs (`T-131` →
+`T-131a`/`T-131b`), the sub-ids have no line of their own, so the writeback falls
+back to the parent (spec `parent_id`, else derived from the id): each finished
+child annotates it, and the checkbox flips to done only once **every** child is
+done. A writeback that still finds nothing logs a WARNING — the board silently
+disagreeing with the store is worse than either being wrong.
 
 **Visual/subjective tasks**: the planner marks subjective acceptance
 (`agent_able: false` → `human_only`) — workers can't see rendered output, UI,

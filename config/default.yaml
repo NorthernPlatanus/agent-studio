@@ -107,14 +107,30 @@ run:
   # cost-efficient refinement ceiling per candidate on a warm cache.
   max_fix_rounds: 4
   # Escalation ladder (Rung 3): when the cheap warm loop exhausts max_fix_rounds
-  # without a green gate, hand the task to a $0-cash SUBSCRIPTION senior (never a
+  # without landing the task, hand it to a $0-cash SUBSCRIPTION senior (never a
   # mid-tier/senior API model). Off by default (needs a smart tier configured).
+  # "Without landing it" covers BOTH shapes of stuck: no green gate, and a green
+  # gate the reviewer keeps sending back with `revise` (the second used to be
+  # unreachable, so a task could exhaust the ladder with the senior never called).
   escalate_on_exhaustion: false
   escalate_target: smart_provider   # the claude_cli/codex_cli subscription tier
   escalate_model: opus              # senior id — MUST co-vary with smart_provider
                                     # (opus/sonnet under claude_cli; a gpt-5.6-* id under codex_cli)
   escalate_effort: null             # senior's reasoning effort; falls back to
                                     # providers.<smart_provider>.effort when null
+  # Retries the escalated senior gets after its own first attempt fails, each fed
+  # the gate log through the ordinary retry branch. The senior used to get exactly
+  # one shot — observed dying on a trivial missing import, i.e. the most expensive
+  # tier getting the fewest chances at the task the cheap tier already failed.
+  # 0 restores the old one-shot behavior.
+  senior_fix_rounds: 1
+  # Attempts in which EVERY candidate returned no <file>/<edit> blocks at all
+  # (prose, a question, a summary) are refunded rather than charged against the
+  # retry ceiling — nothing was attempted. Observed: two consecutive prose replies
+  # to a review `revise` burned two of four fix rounds and forced an escalation.
+  # Bounded, because a model that ALWAYS replies conversationally would otherwise
+  # retry forever; 0 disables the refund.
+  max_unproductive_attempts: 2
   # Routing on the planner's own `risk` / `complexity` labels. Both OFF by
   # default: they trade verification (or cheap-tier attempts) for subscription
   # quota, and which side of that trade you want is a project decision.
@@ -237,7 +253,20 @@ domains: {}
 # COST: the reference inspector exposes ~60 tools whose schemas are re-sent every
 # turn — a measured trivial two-tool query cost ~77k input tokens vs ~13k for a
 # plain call. Once per task, not per attempt, is what makes it affordable. Off by
-# default for that reason.
+# default for that reason. MEASURED on a real task: 387k-410k input tokens per
+# scene verdict, not the ~158k an earlier note claimed.
+#
+# STRUCTURAL LIMIT, and the reason the verifier prompt has an `unverifiable` field:
+# the agent attaches to an app that is ALREADY RUNNING and its read-only toolset
+# (deliberately — see roles.verifier) cannot reload or remount it. So no criterion
+# about the first rendered frame, a startup transient, a transition or a one-shot
+# event can ever be observed here, however many times the task is retried. Such a
+# verdict now ends the task as `needs_human` instead of retrying at ~400k tokens a
+# go; the planner prompt tells the planner not to mark those specs `visual: true`
+# in the first place. Lifting the limit properly means either granting a
+# reload-only capability (navigate/reload, NOT run_js — the "cannot edit the scene
+# into passing" invariant must hold) or having the gate capture the startup frame
+# sequence itself and hand it over. Neither is implemented.
 verify:
   enabled: false
   # Command that starts the candidate's app IN ITS OWN WORKTREE. `{port}` is
