@@ -14,6 +14,11 @@ dependencies = [
 [project.optional-dependencies]
 dev = ["pytest>=8.0", "pytest-asyncio>=0.23"]
 studio = ["langgraph-cli[inmem]>=0.2"]  # graph UI; requires Python 3.11+
+# Control-panel HTTP layer (orchestrator/api, `orchestrator serve`). httpx is
+# listed here deliberately: FastAPI's TestClient needs it and `dev` does not
+# provide it, so tests/api would not even import. Install: pip install -e ".[dev,api]"
+api = ["fastapi>=0.115", "uvicorn[standard]>=0.30", "sse-starlette>=2.1",
+       "httpx>=0.27"]
 
 [build-system]
 requires = ["setuptools>=68"]

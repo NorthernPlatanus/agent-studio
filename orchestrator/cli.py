@@ -8,6 +8,7 @@ Commands:
   status          queue, budgets, and cost breakdown
   metrics         solve rate, escalation frequency, subscription tokens/task
   import-backlog  register backlog items as stubs (no LLM)
+  serve           control-panel HTTP API (read layer + job control), localhost only
 """
 
 from __future__ import annotations
@@ -15,6 +16,7 @@ from __future__ import annotations
 import argparse
 import asyncio
 import logging
+import os
 import sys
 
 from .engine import runner
@@ -88,6 +90,13 @@ def build_parser() -> argparse.ArgumentParser:
 
     p = sub.add_parser("import-backlog", help="register backlog items as stubs (no LLM)")
     _add_common(p)
+
+    p = sub.add_parser("serve", help="run the control-panel HTTP API (localhost only)")
+    _add_common(p)
+    p.add_argument("--host", default="127.0.0.1",
+                   help="bind address; keep it loopback — the API has no auth")
+    p.add_argument("--port", type=int, default=8787)
+    p.add_argument("--reload", action="store_true", help="uvicorn autoreload (dev)")
     return parser
 
 
@@ -217,6 +226,24 @@ def main(argv: list[str] | None = None) -> int:
         n = import_backlog_stubs(ctx)
         print(f"imported {n} new backlog items as stubs (status: needs_plan). "
               f"Run `plan` to enrich them into executable specs.")
+        return 0
+
+    if args.command == "serve":
+        # Imported here, not at module scope: [api] is an optional extra and a
+        # machine without fastapi must still be able to `plan`/`run`.
+        try:
+            import uvicorn
+        except ModuleNotFoundError:
+            print('serve needs the [api] extra: pip install -e ".[dev,api]"')
+            return 2
+        if args.project:
+            # The API resolves the project per request; this only marks which one
+            # the panel preselects, and it survives into the --reload child.
+            os.environ["ORCH_PROJECT"] = args.project
+        print(f"control panel API: http://{args.host}:{args.port}"
+              f"   (schema: /openapi.json)")
+        uvicorn.run("orchestrator.api.app:app", host=args.host, port=args.port,
+                    reload=args.reload)
         return 0
 
     return 1
