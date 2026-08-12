@@ -12,6 +12,7 @@ from __future__ import annotations
 import json
 import logging
 import re
+from collections.abc import Callable
 
 from ..ops.backlog import make_backlog, parent_id as derive_parent_id
 from ..ops import assetops, projectmap
@@ -119,7 +120,8 @@ async def plan_or_ask(ctx: RunContext, *, discussion: str = "", transcript: str 
                       only_ids: list[str] | None = None,
                       session: str | None = None, delta: str = "",
                       effort: str | None = None, model: str | None = None,
-                      session_reuse: bool | None = None) -> dict:
+                      session_reuse: bool | None = None,
+                      on_progress: Callable[[dict], None] | None = None) -> dict:
     """One planner turn. Returns the normalized envelope
     {questions, assumptions, specs} WITHOUT persisting — so `discuss` can loop
     and `plan` can decide what to do with questions. `transcript` carries the
@@ -138,7 +140,11 @@ async def plan_or_ask(ctx: RunContext, *, discussion: str = "", transcript: str 
     this call only. They exist for `discuss`, where an operator adjusts the tier
     mid-conversation — a hard question deserves `high`, and the rest of the
     session should not pay for it. None means "leave the config alone", so every
-    other caller is unaffected."""
+    other caller is unaffected.
+
+    `on_progress` is forwarded to the provider for callers that can show
+    in-flight events. A planner turn is minutes of silence otherwise (measured:
+    334s and up), which the operator cannot tell apart from a hang."""
     provider_name, configured_model = ctx.role_target("planner")
     model = model or configured_model
     provider = get_provider(ctx.cfg, provider_name)
@@ -157,7 +163,8 @@ async def plan_or_ask(ctx: RunContext, *, discussion: str = "", transcript: str 
     try:
         result = await provider.complete(model=model, system=system, user=user,
                                          cwd=str(ctx.cfg.repo_path()),
-                                         session=use_session, effort=effort)
+                                         session=use_session, effort=effort,
+                                         on_progress=on_progress)
     except SessionLost:
         # The abbreviated payload has no context without the session — resend it
         # whole exactly once (the provider already dropped the dead session id,
@@ -167,7 +174,8 @@ async def plan_or_ask(ctx: RunContext, *, discussion: str = "", transcript: str 
             model=model, system=system,
             user=_full_prompt(ctx, discussion=discussion, transcript=transcript,
                               only_ids=only_ids),
-            cwd=str(ctx.cfg.repo_path()), session=use_session, effort=effort)
+            cwd=str(ctx.cfg.repo_path()), session=use_session, effort=effort,
+            on_progress=on_progress)
 
     ctx.budget.record(
         task_id=None, role="planner", provider=provider_name,

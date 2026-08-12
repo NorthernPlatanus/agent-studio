@@ -35,7 +35,8 @@ class RecordingProvider:
         self.calls: list[dict] = []
 
     async def complete(self, *, model, system, user, cwd=None, params=None,
-                       session=None, effort=None):
+                       session=None, effort=None, allowed_tools=None,
+                       mcp_config=None, on_progress=None):
         self.calls.append({"params": params, "user": user})
         return LLMResult(text=self.text)
 

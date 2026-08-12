@@ -1,5 +1,7 @@
 """Orchestrator control-flow exceptions."""
 
+import time
+
 
 class OrchestratorError(Exception):
     """Base class."""
@@ -11,7 +13,31 @@ class LimitExhausted(OrchestratorError):
     Behavior is config-driven (run.on_limit_exhausted):
       pause   -> checkpoint everything and stop; `orchestrator resume` later.
       degrade -> re-route opus roles to run.degrade_model and continue.
+
+    `resets_at` is a unix timestamp when the provider told us one, and None when
+    it did not. The Claude CLI does: every call streams a `rate_limit_event`
+    carrying `{status, resetsAt, rateLimitType}`, so the window's end is a known
+    number rather than something to poll for. `limit_type` is that window's name
+    (`five_hour` / `weekly` …), which matters because they reset on different
+    clocks and a caller waiting out the wrong one waits far too long.
+
+    Callers that can afford to wait (the planner chat, where one session can
+    outlast a five-hour window) should freeze until `resets_at` and carry on.
     """
+
+    def __init__(self, message: str, *, resets_at: float | None = None,
+                 limit_type: str | None = None):
+        super().__init__(message)
+        self.resets_at = resets_at
+        self.limit_type = limit_type
+
+    @property
+    def seconds_until_reset(self) -> float | None:
+        """Seconds from now until the window reopens, floored at 0. None when
+        the provider never told us — the caller must not invent a number."""
+        if self.resets_at is None:
+            return None
+        return max(0.0, self.resets_at - time.time())
 
 
 class BudgetExceeded(OrchestratorError):

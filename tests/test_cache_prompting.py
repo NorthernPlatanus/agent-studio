@@ -28,9 +28,9 @@ class _Cliish(LLMProvider):
 
     async def complete(self, *, model, system, user, cwd=None, params=None,
                        session=None, effort=None,
-                       allowed_tools=None, mcp_config=None):
+                       allowed_tools=None, mcp_config=None, on_progress=None):
         self.seen = {"system": system, "user": user, "cwd": cwd, "params": params,
-                     "session": session}
+                     "session": session, "on_progress": on_progress}
         return LLMResult(text="ok")
 
 

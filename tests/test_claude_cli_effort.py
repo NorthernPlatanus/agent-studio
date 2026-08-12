@@ -5,36 +5,19 @@ spends, and subscription tokens are the binding constraint — so the flag has t
 actually reach the CLI, and a typo must not quietly leave it at the default.
 """
 
-import asyncio
-import json
-
 import pytest
 
 from orchestrator.core.config import Section
 from orchestrator.core.errors import OrchestratorError
 from orchestrator.providers.claude_cli import EFFORT_LEVELS, ClaudeCliProvider
-
-
-class FakeProc:
-    def __init__(self, out: str):
-        self._out = out.encode()
-        self.returncode = 0
-
-    async def communicate(self):
-        return self._out, b""
-
-    def kill(self):
-        pass
-
-    async def wait(self):
-        return 0
+from tests.conftest import FakeCli, stream_json
 
 
 def _provider(monkeypatch, captured: list, **pcfg) -> ClaudeCliProvider:
-    async def fake_exec(*args, **kwargs):
-        captured.append(list(args))
-        return FakeProc(json.dumps({"result": "ok", "usage": {"input_tokens": 1}}))
-    monkeypatch.setattr(asyncio, "create_subprocess_exec", fake_exec)
+    cli = FakeCli({"out": stream_json({"result": "ok",
+                                       "usage": {"input_tokens": 1}})})
+    cli.argv = captured                          # tests assert on `captured`
+    cli.install(monkeypatch)
     base = {"type": "claude_cli", "binary": "claude", "timeout_s": 600}
     return ClaudeCliProvider("claude_cli", Section({**base, **pcfg}),
                              Section({"mcp": {}}))

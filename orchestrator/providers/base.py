@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from abc import ABC, abstractmethod
+from collections.abc import Callable
 from dataclasses import dataclass
 
 
@@ -50,7 +51,9 @@ class LLMProvider(ABC):
                        session: str | None = None,
                        effort: str | None = None,
                        allowed_tools: str | None = None,
-                       mcp_config: str | None = None) -> LLMResult:
+                       mcp_config: str | None = None,
+                       on_progress: Callable[[dict], None] | None = None
+                       ) -> LLMResult:
         """Single-turn completion. `cwd` only matters for CLI providers with
         repo read access. `params` carries optional per-candidate sampling
         overrides (temperature/top_p/seed/...); CLI providers accept and ignore
@@ -69,7 +72,14 @@ class LLMProvider(ABC):
         `allowed_tools` and `mcp_config` are per-ROLE tool policy for CLI
         providers, again resolved by the caller. They exist so one role can be
         granted an inspector's MCP tools without handing the same tools to every
-        other role on the tier — provider-level config cannot express that."""
+        other role on the tier — provider-level config cannot express that.
+
+        `on_progress` receives coarse in-flight events (`{phase, ...}`) while the
+        call runs, for callers that have somewhere to show them — the planner
+        chat, where one turn is minutes long and a silent spinner is
+        indistinguishable from a hang. It is advisory: providers that cannot
+        stream simply never call it, and a callback that raises is logged and
+        ignored rather than failing a call that has already been paid for."""
 
     async def complete_chat(self, *, model: str, system: str,
                             messages: list[dict], cwd: str | None = None,
@@ -77,7 +87,9 @@ class LLMProvider(ABC):
                             session: str | None = None,
                             effort: str | None = None,
                             allowed_tools: str | None = None,
-                            mcp_config: str | None = None) -> LLMResult:
+                            mcp_config: str | None = None,
+                            on_progress: Callable[[dict], None] | None = None
+                            ) -> LLMResult:
         """Multi-turn completion over role/content dicts.
 
         Default implementation is the stable-prefix passthrough: it flattens the
@@ -91,4 +103,5 @@ class LLMProvider(ABC):
         return await self.complete(model=model, system=system, user=user,
                                    cwd=cwd, params=params, session=session,
                                    effort=effort, allowed_tools=allowed_tools,
-                                   mcp_config=mcp_config)
+                                   mcp_config=mcp_config,
+                                   on_progress=on_progress)

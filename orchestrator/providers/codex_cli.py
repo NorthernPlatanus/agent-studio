@@ -25,18 +25,24 @@ to the user prompt.
 
 from __future__ import annotations
 
-import asyncio
 import json
 import logging
 import os
 import re
 import tempfile
+from collections.abc import Callable
 from pathlib import Path
 
 from ..core.errors import LimitExhausted, OrchestratorError
+from ._process import CliTimeout, stream_cli
 from .base import LLMProvider, LLMResult
 
 log = logging.getLogger("orchestrator.codex_cli")
+
+#: Fallbacks when the provider config sets neither. See claude_cli for the
+#: reasoning behind an idle clock and a loose absolute backstop.
+DEFAULT_IDLE_TIMEOUT_S = 300
+DEFAULT_TOTAL_TIMEOUT_S = 3600
 
 # Codex limit/quota wording (broad, like claude_cli — extend as observed).
 LIMIT_PATTERNS = re.compile(
@@ -124,7 +130,9 @@ class CodexCliProvider(LLMProvider):
                        session: str | None = None,
                        effort: str | None = None,
                        allowed_tools: str | None = None,
-                       mcp_config: str | None = None) -> LLMResult:
+                       mcp_config: str | None = None,
+                       on_progress: Callable[[dict], None] | None = None
+                       ) -> LLMResult:
         # `session` is accepted for signature parity and ignored: `codex exec` is
         # one-shot, and session_active() correctly reports False, so callers
         # always send the full self-contained payload on this provider.
@@ -159,30 +167,45 @@ class CodexCliProvider(LLMProvider):
         args += self._mcp_config_args()
         args += [prompt]
 
-        timeout = int(self.pcfg.get("timeout_s", 600))
+        # Idle, not wall-clock — the same reasoning as claude_cli (see
+        # _process.stream_cli): `codex exec` runs a tool loop whose length the
+        # model decides, and it streams progress to stderr throughout, so
+        # silence is the only honest signal that it has stopped working.
+        idle_s = float(self.pcfg.get("idle_timeout_s", DEFAULT_IDLE_TIMEOUT_S))
+        total_s = self.pcfg.get("timeout_s", DEFAULT_TOTAL_TIMEOUT_S)
+        total_s = float(total_s) if total_s else None
         log.debug("codex_cli: %s exec ... (cwd=%s, sandbox=%s)",
                   binary, cwd, "bypass" if bypass else self._sandbox_mode())
-        proc = await asyncio.create_subprocess_exec(
-            *args, cwd=cwd,
-            stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE)
+        # `codex exec --json` emits JSONL events. They are collected HERE rather
+        # than read back off `run.stdout`, which keeps only a bounded head for
+        # error messages — `_parse_events` needs every event to find the usage
+        # numbers, and a long run would otherwise silently lose its token ledger.
+        # They double as coarse progress for a caller with somewhere to show it.
+        events: list[str] = []
+
+        def on_line(tag: str, line: str) -> None:
+            if tag != "stdout" or not line.startswith("{"):
+                return
+            events.append(line)
+            if on_progress is not None:
+                on_progress({"phase": "event", "text": line[:200]})
+
         try:
-            stdout_b, stderr_b = await asyncio.wait_for(
-                proc.communicate(), timeout)
-        except asyncio.TimeoutError:
-            proc.kill()
-            await proc.wait()  # reap; avoid a zombie process
+            run = await stream_cli(args, cwd=cwd, idle_timeout_s=idle_s,
+                                   total_timeout_s=total_s, on_line=on_line)
+        except CliTimeout as e:
             _safe_unlink(last_msg_path)
-            raise OrchestratorError(f"codex CLI timed out after {timeout}s")
+            raise OrchestratorError(f"codex CLI {e}") from e
 
-        out, err = stdout_b.decode(), stderr_b.decode()
-        combined = out + "\n" + err
+        out = "\n".join(events)
+        combined = run.combined
 
-        if proc.returncode != 0:
+        if run.returncode != 0:
             _safe_unlink(last_msg_path)
             if LIMIT_PATTERNS.search(combined):
                 raise LimitExhausted(f"codex CLI limit: {combined.strip()[:500]}")
             raise OrchestratorError(
-                f"codex CLI exited {proc.returncode}: {combined.strip()[:1000]}")
+                f"codex CLI exited {run.returncode}: {combined.strip()[:1000]}")
 
         text, in_tok, out_tok, cached = self._parse_events(out)
         # --output-last-message is the most reliable source of the final text.
