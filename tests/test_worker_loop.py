@@ -90,7 +90,8 @@ class ScriptedProvider:
         self.last_messages = None
 
     async def complete(self, *, model, system, user, cwd=None, params=None,
-                       session=None, effort=None):
+                       session=None, effort=None, allowed_tools=None,
+                       mcp_config=None, on_progress=None):
         text = self.responses[min(self.calls, len(self.responses) - 1)]
         self.calls += 1
         return LLMResult(text=text)

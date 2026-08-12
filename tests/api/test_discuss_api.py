@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import asyncio
 import copy
+import time
 from pathlib import Path
 
 import pytest
@@ -23,6 +24,7 @@ from orchestrator.api.app import create_app
 from orchestrator.api.discuss import DiscussManager, get_manager
 from orchestrator.api.jobs import JobSupervisor
 from orchestrator.core.config import Config, load_config
+from orchestrator.core.errors import OrchestratorError
 from orchestrator.nodes import discuss as discuss_node
 from tests.api.fixtures import seed_store
 
@@ -480,3 +482,96 @@ async def test_a_frame_pushed_during_the_replay_is_not_lost():
         "a frame pushed during the replay never reached the subscriber")
     session.detach(queue)
     assert session._subscribers == []
+
+
+# ---- a failed turn stays in the conversation -------------------------------
+
+class FailingThenFine:
+    """Fails the first turn the way a wedged CLI does, then proposes."""
+
+    def __init__(self, envelope):
+        self.envelope = envelope
+        self.calls = 0
+
+    async def __call__(self, ctx, **kwargs):
+        self.calls += 1
+        if self.calls == 1:
+            raise OrchestratorError("claude CLI produced no output for 300s")
+        return copy.deepcopy(self.envelope)
+
+
+def test_a_failed_turn_leaves_the_session_open_for_a_retry(
+        client: TestClient, monkeypatch):
+    """This is the reported bug end to end: the turn dies, and the session used
+    to go `failed`/`closed`, discarding the conversation. It must instead offer
+    another attempt over the same session."""
+    planner = FailingThenFine(PROPOSAL)
+    monkeypatch.setattr(discuss_node, "plan_or_ask", planner)
+
+    session_id = _start(client)["session_id"]
+    offered = _await_status(client, session_id, "awaiting")
+    assert offered["expects"] == "retry"
+    failed = next(f for f in offered["frames"] if f["kind"] == "turn_failed")
+    assert "300s" in failed["data"]["text"]
+    assert offered["status"] != "failed"          # still live, still ours
+
+    client.post(f"{BASE}/{session_id}/reply", json={"text": ""})
+    deciding = _await_status(client, session_id, "awaiting")
+    assert deciding["expects"] == "decision"      # it recovered on the retry
+    client.post(f"{BASE}/{session_id}/reply", json={"text": "y"})
+    done = _await_status(client, session_id, "done")
+    assert [s["id"] for s in done["applied"]] == ["T-900"]
+
+
+def test_progress_frames_do_not_evict_the_conversation(client: TestClient,
+                                                       monkeypatch):
+    """Progress is live-only. Retaining hundreds per turn would push the
+    operator's own messages out of the replay log."""
+    async def chatty(ctx, *, on_progress=None, **kwargs):
+        for i in range(50):
+            on_progress({"phase": "tool", "tool": "Read", "target": f"f{i}.ts"})
+        return copy.deepcopy(PROPOSAL)
+
+    monkeypatch.setattr(discuss_node, "plan_or_ask", chatty)
+    session_id = _start(client)["session_id"]
+    deciding = _await_status(client, session_id, "awaiting")
+    kinds = [f["kind"] for f in deciding["frames"]]
+    assert kinds.count("progress") == 1           # only the latest is retained
+    assert "you" in kinds and "specs_preview" in kinds
+    latest = next(f for f in deciding["frames"] if f["kind"] == "progress")
+    assert latest["data"]["target"] == "f49.ts"
+
+
+def test_a_frozen_session_is_not_reaped_as_idle():
+    """A five-hour usage window is ten times the idle TTL. Reaping a frozen
+    session would abort exactly the sessions the freeze exists to save."""
+    manager = DiscussManager(idle_ttl_s=0.01)
+    session = discuss_mod.Session(session_id="s1", project=PROJECT, request="r",
+                                  started_at=time.time())
+    manager._sessions["s1"] = session
+    session.push({"kind": "thinking"})
+    session.push({"kind": "limit_paused", "resets_at": time.time() + 3600,
+                  "seconds": 3600, "limit_type": "five_hour"})
+    session.push({"kind": "awaiting", "expects": "frozen"})
+    session.last_activity = time.time() - 3600          # long "idle"
+
+    manager.reap()
+    assert session.live, "the freeze was reaped as an idle tab"
+    assert not session._aborting
+
+    # And once the window has passed, it is an ordinary idle session again.
+    # `_aborting` rather than `status`: tearing down signals the loop through
+    # its own inbox, and the status flips when the loop unwinds — there is no
+    # loop here, only the manager.
+    session.frozen_until = time.time() - 1
+    manager.reap()
+    assert session._aborting
+
+
+def test_the_freeze_clears_when_the_turn_resumes():
+    session = discuss_mod.Session(session_id="s2", project=PROJECT, request="r",
+                                  started_at=time.time())
+    session.push({"kind": "limit_paused", "seconds": 3600})
+    assert session.frozen_until is not None
+    session.push({"kind": "thinking"})                  # the retry started
+    assert session.frozen_until is None

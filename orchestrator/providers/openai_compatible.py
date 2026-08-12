@@ -9,6 +9,7 @@ from __future__ import annotations
 import logging
 import os
 import re
+from collections.abc import Callable
 
 from openai import AsyncOpenAI
 
@@ -61,7 +62,12 @@ class OpenAICompatibleProvider(LLMProvider):
                        session: str | None = None,
                        effort: str | None = None,
                        allowed_tools: str | None = None,
-                       mcp_config: str | None = None) -> LLMResult:
+                       mcp_config: str | None = None,
+                       on_progress: Callable[[dict], None] | None = None
+                       ) -> LLMResult:
+        # `on_progress` is ignored: this provider awaits one non-streaming HTTP
+        # response, so there is no in-flight event to report. Callers get the
+        # documented "never called" behavior rather than a fabricated heartbeat.
         # `session` is ignored: a chat-completions endpoint is stateless, so the
         # full messages array IS the context (and session_active() says False, so
         # callers never abbreviate on this provider). `effort` is ignored too —
@@ -78,10 +84,12 @@ class OpenAICompatibleProvider(LLMProvider):
                             session: str | None = None,
                             effort: str | None = None,
                             allowed_tools: str | None = None,
-                            mcp_config: str | None = None) -> LLMResult:
+                            mcp_config: str | None = None,
+                            on_progress: Callable[[dict], None] | None = None
+                            ) -> LLMResult:
         """Pass the native OpenAI messages array through so the endpoint's
         automatic prefix caching sees a byte-stable prefix across turns.
-        `session`/`effort` are accepted for signature parity and ignored."""
+        `session`/`effort`/`on_progress` are accepted for parity and ignored."""
         wire = [{"role": "system", "content": system}] + [
             {"role": m["role"], "content": m["content"]} for m in messages
             if m.get("role") != "system"]

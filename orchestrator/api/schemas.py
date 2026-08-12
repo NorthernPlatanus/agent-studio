@@ -449,9 +449,16 @@ MAX_PIN_CHARS = 256 * 1024
 DiscussStatus = Literal["running", "awaiting", "done", "aborted", "failed"]
 #: What the loop is blocked on. `answer` = the planner asked something;
 #: `decision` = a spec preview is on the table and wants y / edit / abort.
-DiscussExpects = Literal["answer", "decision"]
-DiscussFrameKind = Literal["you", "thinking", "assumption", "question", "awaiting",
-                           "note", "specs_preview", "applied", "aborted", "error",
+#: `retry` = the planner turn itself failed and the session is offering another
+#: attempt. It is an `awaiting` state like the others precisely so a failed turn
+#: keeps the conversation open instead of ending it.
+#: `frozen` = the subscription window is exhausted and the loop is waiting for
+#: it to reset before retrying the turn by itself. The operator is not being
+#: asked a question — they are only being offered the chance to give up.
+DiscussExpects = Literal["answer", "decision", "retry", "frozen"]
+DiscussFrameKind = Literal["you", "thinking", "progress", "assumption", "question",
+                           "awaiting", "note", "specs_preview", "applied",
+                           "aborted", "turn_failed", "limit_paused", "error",
                            "closed"]
 
 
@@ -537,7 +544,10 @@ class DiscussFrame(BaseModel):
     # always sends. An empty dict is the empty case.
     data: dict[str, Any] = Field(
         description="kind-dependent: `question` carries id/q/why, `specs_preview` "
-                    "carries the proposed specs, `you` carries text")
+                    "carries the proposed specs, `you` carries text, `progress` "
+                    "carries phase/tool/target/text while a turn runs, "
+                    "`turn_failed` carries text, and `limit_paused` carries "
+                    "text/resets_at/limit_type/seconds")
 
 
 class DiscussSessionModel(BaseModel):

@@ -30,6 +30,7 @@ neither supplied this file behaves exactly as the CLI has always behaved:
 
 from __future__ import annotations
 
+import asyncio
 import inspect
 import json
 import logging
@@ -37,6 +38,7 @@ from collections.abc import Callable
 from dataclasses import dataclass, field
 
 from ..core.context import RunContext
+from ..core.errors import LimitExhausted, PlannerNeedsInput, SessionLost
 from ..providers import get_provider
 from .planner import persist_specs, plan_or_ask
 
@@ -120,6 +122,31 @@ async def _ask(read, prompt: str) -> str:
     return await value if inspect.isawaitable(value) else value
 
 
+async def _wait_or_interrupt(read, prompt: str, seconds: float) -> str | None:
+    """Wait out `seconds`, unless the operator says something first.
+
+    Returns their message, or None if the wait simply expired.
+
+    This is how a freeze stays abortable. Plain `asyncio.sleep` would be simpler
+    and wrong: the API delivers an abort by putting a sentinel on the very queue
+    `read` awaits, so a loop that is sleeping instead of reading would leave a
+    closed browser tab holding the project's write lock for the length of a
+    five-hour window.
+
+    The CLI's `read` is blocking `input()`, which cannot be polled without
+    blocking the shared event loop — there the wait is just a wait, and the
+    terminal operator interrupts with Ctrl-C as they always have.
+    """
+    value = read(prompt)
+    if not inspect.isawaitable(value):
+        await asyncio.sleep(seconds)
+        return None
+    try:
+        return await asyncio.wait_for(value, seconds)
+    except (asyncio.TimeoutError, TimeoutError):
+        return None
+
+
 def _format(turns: list[tuple[str, str]]) -> str:
     return "\n".join(f"{role.upper()}: {text}" for role, text in turns)
 
@@ -175,12 +202,86 @@ async def run_discuss(ctx: RunContext, initial: str, *,
         # whole whenever the provider session is not being reused.
         pinned = opts.context_block()
         transcript = _format(turns) + (f"\n{pinned}" if pinned else "")
-        say({"kind": "thinking"})
-        env = await plan_or_ask(ctx, discussion=opts.note, transcript=transcript,
-                                only_ids=opts.only_ids, session=llm_session,
-                                delta=delta, effort=opts.effort, model=opts.model,
-                                session_reuse=opts.session_reuse)
+        # Persist BEFORE the call, not after. A planner turn is minutes long and
+        # can fail (a wedge, a 5xx, a limit hit); saving only on success meant a
+        # failure on turn 1 persisted nothing at all, and the operator restarted
+        # the conversation from their first message.
         ctx.store.save_discussion(session, _format(turns))
+        say({"kind": "thinking"})
+        try:
+            env = await plan_or_ask(ctx, discussion=opts.note, transcript=transcript,
+                                    only_ids=opts.only_ids, session=llm_session,
+                                    delta=delta, effort=opts.effort, model=opts.model,
+                                    session_reuse=opts.session_reuse,
+                                    on_progress=lambda e: say({"kind": "progress", **e}))
+        except (PlannerNeedsInput, SessionLost):
+            raise                       # control flow, not failure — let it out
+        except Exception as e:          # noqa: BLE001 — offered back to the operator
+            # One failed turn is not a failed conversation. The transcript is
+            # intact and the next attempt is cheap to ask for, so report it and
+            # hand control back rather than tearing the session down — which is
+            # what used to happen, discarding every answer the operator had
+            # already typed.
+            log.warning("planner turn failed: %s", e, exc_info=True)
+            # Drop provider-side continuity. `session_reuse` sends only the newest
+            # human turn once the provider reports a live session, which is a bet
+            # that the session holds everything else — and after a failed turn
+            # that bet is off (the call may have died before its payload ever
+            # landed). Ending it costs one re-send of context we still have, and
+            # buys a next attempt that is self-contained.
+            _end_session(ctx, llm_session)
+            delta = ""
+
+            # A planning session can outlast the five-hour window it is spending:
+            # one turn was measured at ~520k subscription tokens, so a real
+            # conversation exhausts the quota mid-plan. That is not a failure to
+            # report — it is a clock that has not rolled over — so the loop
+            # FREEZES until the window reopens and retries the turn itself.
+            wait_s = _freeze_seconds(e, ctx.cfg)
+            if wait_s is not None:
+                log.warning("subscription limit hit; freezing %.0fs until the %s "
+                            "window resets", wait_s, e.limit_type or "usage")
+                write(f"subscription limit reached — waiting "
+                      f"{wait_s / 60:.0f} min for the "
+                      f"{e.limit_type or 'usage'} window to reset, then "
+                      f"retrying this turn.")
+                say({"kind": "limit_paused", "text": str(e),
+                     "resets_at": e.resets_at, "limit_type": e.limit_type,
+                     "seconds": wait_s})
+                say({"kind": "awaiting", "expects": "frozen"})
+                typed = await _wait_or_interrupt(
+                    read, "waiting for the limit to reset — "
+                          "type 'abort' to give up> ", wait_s)
+                if typed is not None and typed.strip().lower() in (
+                        "abort", "a", "quit", "q"):
+                    write("aborted while waiting for the limit to reset.")
+                    say({"kind": "aborted",
+                         "reason": "operator gave up on the freeze"})
+                    return []
+                if typed:
+                    turns.append(("user", typed))
+                    say({"kind": "you", "text": typed})
+                    delta = typed
+                say({"kind": "note", "text": "the usage window reset — retrying"})
+                continue
+            # Anything else — including a limit we cannot time — is offered back.
+            detail = f"{type(e).__name__}: {e}"
+            write(f"the planner turn failed: {detail}")
+            say({"kind": "turn_failed", "text": detail})
+            say({"kind": "awaiting", "expects": "retry"})
+            answer = (await _ask(read, "retry? [enter to retry / or type more "
+                                       "context / 'abort']> ") or "").strip()
+            if answer.lower() in ("abort", "a", "quit", "q"):
+                write("aborted.")
+                say({"kind": "aborted", "reason": "operator abandoned a failed turn"})
+                return []
+            if answer:
+                # Anything typed is context for the retry, not a new question —
+                # the planner never got to answer the previous one.
+                turns.append(("user", answer))
+                say({"kind": "you", "text": answer})
+                delta = answer
+            continue
 
         capped = (opts.max_question_rounds > 0
                   and question_rounds >= opts.max_question_rounds)
@@ -259,6 +360,44 @@ async def run_discuss(ctx: RunContext, initial: str, *,
         turns.append(("user", f"EDIT: {note}"))
         say({"kind": "you", "text": f"EDIT: {note}"})
         delta = f"EDIT: {note}"
+
+
+#: How long a session may sit frozen waiting for a usage window, when the config
+#: says nothing. Six hours clears a five-hour window with room for clock skew;
+#: anything longer is a wait the operator should be asked about instead.
+DEFAULT_FREEZE_CAP_S = 6 * 3600
+
+
+def _freeze_cap(cfg) -> float:
+    """The longest freeze this project will sit through. 0 disables freezing
+    entirely, which turns a limit back into an ordinary failed turn."""
+    try:
+        return float(cfg.run.get("limit_freeze_max_s", DEFAULT_FREEZE_CAP_S))
+    except (AttributeError, TypeError, ValueError):
+        return DEFAULT_FREEZE_CAP_S
+
+
+def _freeze_seconds(exc: Exception, cfg) -> float | None:
+    """How long to freeze for this failure, or None to treat it as an ordinary
+    failed turn.
+
+    Only a `LimitExhausted` that came with a reported reset time is waited on. A
+    limit with no `resets_at` is NOT guessed at — a fabricated wait is how a
+    session disappears for hours over what may have been a transient refusal —
+    and neither is one further out than the operator's cap.
+    """
+    if not isinstance(exc, LimitExhausted):
+        return None
+    wait_s = exc.seconds_until_reset
+    if wait_s is None:
+        log.warning("limit hit with no reported reset time; not freezing")
+        return None
+    cap = _freeze_cap(cfg)
+    if wait_s > cap or cap <= 0:
+        log.warning("limit resets in %.0fs, past the %.0fs cap; not freezing",
+                    wait_s, cap)
+        return None
+    return wait_s
 
 
 def _end_session(ctx: RunContext, key: str) -> None:

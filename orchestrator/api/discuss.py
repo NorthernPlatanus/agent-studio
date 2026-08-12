@@ -84,6 +84,11 @@ class Session:
     frames: list[Frame] = field(default_factory=list)
     settings: DiscussSettings = field(default_factory=DiscussSettings)
     last_activity: float = field(default_factory=time.time)
+    #: Unix time this session is frozen until, while it waits out an exhausted
+    #: usage window. Exempts it from the idle reaper (see `DiscussManager.reap`)
+    #: — a five-hour window is many times the idle TTL, and a frozen session is
+    #: waiting on a clock, not on the operator.
+    frozen_until: float | None = None
 
     _seq: int = 0
     _inbox: asyncio.Queue = field(default_factory=asyncio.Queue, repr=False)
@@ -97,12 +102,30 @@ class Session:
         self._seq += 1
         frame = Frame(seq=self._seq, ts=time.time(), kind=kind,
                       data={k: v for k, v in event.items() if k != "kind"})
+        # `progress` is live-only: hundreds arrive per planner turn, and on
+        # replay "reading src/foo.ts" from ten minutes ago says nothing. Retaining
+        # them would push the operator's OWN messages out of a 2000-frame log
+        # within a few turns. Subscribers still see every one; the log keeps just
+        # the latest, so a reconnect mid-turn can still show current activity.
+        if kind == "progress":
+            self.frames = [f for f in self.frames if f.kind != "progress"]
         self.frames.append(frame)
         if len(self.frames) > MAX_FRAMES:
             del self.frames[:-MAX_FRAMES]
         # `status` is derived from the frames rather than tracked separately, so
         # a reconnect that replays the log lands in the same state the live
         # stream would have shown.
+        if kind == "limit_paused":
+            # Recorded from the frame rather than tracked by the loop: the API
+            # never sees the freeze itself, only the events it emits.
+            resets_at = event.get("resets_at")
+            seconds = event.get("seconds")
+            if isinstance(resets_at, (int, float)):
+                self.frozen_until = float(resets_at)
+            elif isinstance(seconds, (int, float)):
+                self.frozen_until = time.time() + float(seconds)
+        elif kind == "thinking":
+            self.frozen_until = None        # the window reopened; the turn is live
         if kind == "awaiting":
             self.status, self.expects = "awaiting", event.get("expects")
         elif kind in ("applied", "aborted"):
@@ -213,6 +236,12 @@ class DiscussManager:
 
     def reap(self) -> None:
         for session in list(self._sessions.values()):
+            # A session frozen on an exhausted usage window is NOT idle — it is
+            # waiting on a clock it reported, and a five-hour window outlasts
+            # this TTL many times over. Reaping it would abort exactly the
+            # sessions the freeze exists to save.
+            if session.frozen_until and time.time() < session.frozen_until:
+                continue
             idle = time.time() - session.last_activity
             if session.live and idle > self.idle_ttl_s:
                 log.info("discuss session %s idle for %.0fs — closing",

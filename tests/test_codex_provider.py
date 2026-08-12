@@ -2,7 +2,6 @@
 raise the right control-flow errors. No real codex binary or network.
 """
 
-import asyncio
 from pathlib import Path
 
 import pytest
@@ -10,6 +9,7 @@ import pytest
 from orchestrator.core.config import Section
 from orchestrator.core.errors import LimitExhausted, OrchestratorError
 from orchestrator.providers.codex_cli import CodexCliProvider
+from tests.conftest import FakeCli
 
 SUCCESS_JSONL = "\n".join([
     '{"type":"item.started","item":{"type":"agent_message"}}',
@@ -18,26 +18,8 @@ SUCCESS_JSONL = "\n".join([
 ])
 
 
-class FakeProc:
-    def __init__(self, out: str, err: str, rc: int):
-        self._out = out.encode()
-        self._err = err.encode()
-        self.returncode = rc
-
-    async def communicate(self):
-        return self._out, self._err
-
-    def kill(self):
-        pass
-
-    async def wait(self):
-        return 0
-
-
 def _patch(monkeypatch, out, err, rc):
-    async def fake_exec(*args, **kwargs):
-        return FakeProc(out, err, rc)
-    monkeypatch.setattr(asyncio, "create_subprocess_exec", fake_exec)
+    FakeCli({"out": out, "err": err, "rc": rc}).install(monkeypatch)
 
 
 def _provider(monkeypatch, out="", err="", rc=0, pcfg=None, cfg=None):
@@ -117,14 +99,7 @@ def test_mcp_translated_when_enabled(monkeypatch):
 
 def _capture(monkeypatch, out="", err="", rc=0):
     """Patch create_subprocess_exec to record the argv the provider assembles."""
-    captured: dict = {}
-
-    async def fake_exec(*args, **kwargs):
-        captured["args"] = list(args)
-        return FakeProc(out, err, rc)
-
-    monkeypatch.setattr(asyncio, "create_subprocess_exec", fake_exec)
-    return captured
+    return FakeCli({"out": out, "err": err, "rc": rc}).install(monkeypatch)
 
 
 def _provider_cfg(**pcfg_over):
@@ -136,20 +111,20 @@ def _provider_cfg(**pcfg_over):
 
 
 async def test_mcp_bypass_adds_flag_and_drops_sandbox(monkeypatch):
-    captured = _capture(monkeypatch, out=SUCCESS_JSONL, rc=0)
+    cli = _capture(monkeypatch, out=SUCCESS_JSONL, rc=0)
     p = _provider_cfg(enable_mcp=True, mcp_bypass=True)
     await p.complete(model="m", system="", user="x")
-    args = captured["args"]
+    args = cli.argv[0]
     assert "--dangerously-bypass-approvals-and-sandbox" in args
     assert "--sandbox" not in args              # bypass removes the sandbox; no conflict
     assert "--model" in args and "--json" in args  # rest of the argv still assembled
 
 
 async def test_no_bypass_keeps_sandbox(monkeypatch):
-    captured = _capture(monkeypatch, out=SUCCESS_JSONL, rc=0)
+    cli = _capture(monkeypatch, out=SUCCESS_JSONL, rc=0)
     p = _provider_cfg(allowed_tools="workspace-write")   # no enable_mcp / mcp_bypass
     await p.complete(model="m", system="", user="x")
-    args = captured["args"]
+    args = cli.argv[0]
     assert "--dangerously-bypass-approvals-and-sandbox" not in args
     assert "--sandbox" in args
     assert args[args.index("--sandbox") + 1] == "workspace-write"
@@ -157,10 +132,10 @@ async def test_no_bypass_keeps_sandbox(monkeypatch):
 
 async def test_bypass_requires_both_flags(monkeypatch):
     # enable_mcp alone (mcp_bypass still false) must NOT trip the bypass.
-    captured = _capture(monkeypatch, out=SUCCESS_JSONL, rc=0)
+    cli = _capture(monkeypatch, out=SUCCESS_JSONL, rc=0)
     p = _provider_cfg(enable_mcp=True, mcp_bypass=False)
     await p.complete(model="m", system="", user="x")
-    args = captured["args"]
+    args = cli.argv[0]
     assert "--dangerously-bypass-approvals-and-sandbox" not in args
     assert "--sandbox" in args
     assert args[args.index("--sandbox") + 1] == "read-only"

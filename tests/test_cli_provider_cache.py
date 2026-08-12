@@ -5,34 +5,15 @@ on, so the smart-tier cache question cannot even be measured. Also covers the
 `status` cache columns (item 12) that surface it.
 """
 
-import asyncio
-import json
-
 from orchestrator.core.config import Section
 from orchestrator.ops.store import Store
 from orchestrator.providers.claude_cli import ClaudeCliProvider, cache_tokens
 from orchestrator.providers.codex_cli import CodexCliProvider
-
-
-class FakeProc:
-    def __init__(self, out: str, rc: int = 0):
-        self._out = out.encode()
-        self.returncode = rc
-
-    async def communicate(self):
-        return self._out, b""
-
-    def kill(self):
-        pass
-
-    async def wait(self):
-        return 0
+from tests.conftest import FakeCli, stream_json
 
 
 def _claude(monkeypatch, payload: dict) -> ClaudeCliProvider:
-    async def fake_exec(*args, **kwargs):
-        return FakeProc(json.dumps(payload))
-    monkeypatch.setattr(asyncio, "create_subprocess_exec", fake_exec)
+    FakeCli({"out": stream_json(payload)}).install(monkeypatch)
     return ClaudeCliProvider(
         "claude_cli",
         Section({"type": "claude_cli", "binary": "claude", "timeout_s": 600}),
@@ -80,9 +61,7 @@ async def test_claude_cli_old_payload_without_cache_fields(monkeypatch):
 # ---- codex_cli ---------------------------------------------------------------
 
 def _codex(monkeypatch, jsonl: str) -> CodexCliProvider:
-    async def fake_exec(*args, **kwargs):
-        return FakeProc(jsonl)
-    monkeypatch.setattr(asyncio, "create_subprocess_exec", fake_exec)
+    FakeCli({"out": jsonl}).install(monkeypatch)
     return CodexCliProvider(
         "codex_cli",
         Section({"type": "codex_cli", "binary": "codex", "allowed_tools": "read-only",

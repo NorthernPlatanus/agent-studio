@@ -6,13 +6,12 @@ provider); step 4 lets the Claude CLI continue one conversation across the turns
 of a `discuss` loop instead of re-sending backlog + map + specs each time.
 """
 
-import asyncio
-import json
 from pathlib import Path
 
 import pytest
 
 import orchestrator.nodes.planner as planner_mod
+from tests.conftest import FakeCli, stream_json
 from orchestrator.core.config import Config, Section, load_config
 from orchestrator.core.context import RunContext
 from orchestrator.core.errors import SessionLost
@@ -55,79 +54,56 @@ def test_candidate_order_does_not_depend_on_dict_order():
 
 # ---- step 4: claude_cli sessions ---------------------------------------------
 
-class FakeProc:
-    def __init__(self, out: str, rc: int = 0, err: str = ""):
-        self._out, self._err, self.returncode = out.encode(), err.encode(), rc
-
-    async def communicate(self):
-        return self._out, self._err
-
-    def kill(self):
-        pass
-
-    async def wait(self):
-        return 0
+_OK = {"out": stream_json({"result": "ok",
+                           "usage": {"input_tokens": 1, "output_tokens": 1}})}
 
 
-def _cli(monkeypatch, outs):
-    """Provider whose subprocess returns `outs` in sequence; records argv."""
-    seen = []
-    queue = list(outs)
-
-    async def fake_exec(*args, **kwargs):
-        seen.append(list(args))
-        return queue.pop(0) if len(queue) > 1 else queue[0]
-
-    monkeypatch.setattr(asyncio, "create_subprocess_exec", fake_exec)
+def _cli(monkeypatch, *specs):
+    """Provider whose subprocess is scripted by `specs`; records argv."""
+    cli = FakeCli(*specs).install(monkeypatch)
     p = ClaudeCliProvider("claude_cli",
                           Section({"type": "claude_cli", "binary": "claude",
-                                   "timeout_s": 600}),
+                                   "timeout_s": 600, "retry_attempts": 1}),
                           Section({"mcp": {}}))
-    return p, seen
-
-
-_OK = FakeProc(json.dumps({"result": "ok", "usage": {"input_tokens": 1,
-                                                     "output_tokens": 1}}))
+    return p, cli
 
 
 async def test_no_session_key_means_no_session_flags(monkeypatch):
-    p, seen = _cli(monkeypatch, [_OK])
+    p, cli = _cli(monkeypatch, _OK)
     await p.complete(model="opus", system="S", user="U")
-    assert "--session-id" not in seen[0] and "--resume" not in seen[0]
+    assert "--session-id" not in cli.argv[0] and "--resume" not in cli.argv[0]
     assert p.session_active("anything") is False
 
 
 async def test_first_call_pins_a_session_then_resumes_it(monkeypatch):
-    p, seen = _cli(monkeypatch, [_OK])
+    p, cli = _cli(monkeypatch, _OK)
     await p.complete(model="opus", system="S", user="turn 1", session="discuss:r1")
-    assert "--session-id" in seen[0]
-    sid = seen[0][seen[0].index("--session-id") + 1]
-    assert len(sid) == 36 and sid.count("-") == 4          # a uuid, as required
+    sid = cli.flag("--session-id", 0)
+    assert sid and len(sid) == 36 and sid.count("-") == 4   # a uuid, as required
     assert p.session_active("discuss:r1") is True
 
     await p.complete(model="opus", system="S", user="turn 2", session="discuss:r1")
-    assert seen[1][seen[1].index("--resume") + 1] == sid
-    assert "--session-id" not in seen[1]
+    assert cli.flag("--resume", 1) == sid
+    assert "--session-id" not in cli.argv[1]
 
 
 async def test_distinct_keys_get_distinct_sessions(monkeypatch):
-    p, seen = _cli(monkeypatch, [_OK])
+    p, cli = _cli(monkeypatch, _OK)
     await p.complete(model="opus", system="S", user="a", session="k1")
     await p.complete(model="opus", system="S", user="b", session="k2")
-    assert seen[0][seen[0].index("--session-id") + 1] != \
-        seen[1][seen[1].index("--session-id") + 1]
+    assert cli.flag("--session-id", 0) != cli.flag("--session-id", 1)
 
 
 async def test_end_session_forgets_the_key(monkeypatch):
-    p, _ = _cli(monkeypatch, [_OK])
+    p, _ = _cli(monkeypatch, _OK)
     await p.complete(model="opus", system="S", user="a", session="k")
     p.end_session("k")
     assert p.session_active("k") is False
 
 
 async def test_failed_resume_raises_session_lost_and_drops_the_id(monkeypatch):
-    lost = FakeProc("", rc=1, err="No conversation found with session ID abc")
-    p, seen = _cli(monkeypatch, [_OK, lost])
+    lost = {"rc": 1, "err": "No conversation found with session ID abc"}
+    p, _ = _cli(monkeypatch, _OK, lost)
     await p.complete(model="opus", system="S", user="a", session="k")
     with pytest.raises(SessionLost):
         await p.complete(model="opus", system="S", user="b", session="k")
@@ -136,16 +112,16 @@ async def test_failed_resume_raises_session_lost_and_drops_the_id(monkeypatch):
 
 async def test_other_failures_are_not_mistaken_for_a_lost_session(monkeypatch):
     from orchestrator.core.errors import LimitExhausted, OrchestratorError
-    boom = FakeProc("", rc=1, err="something else went wrong")
-    p, _ = _cli(monkeypatch, [_OK, boom])
+    boom = {"rc": 1, "err": "something else went wrong"}
+    p, _ = _cli(monkeypatch, _OK, boom)
     await p.complete(model="opus", system="S", user="a", session="k")
     with pytest.raises(OrchestratorError) as e:
         await p.complete(model="opus", system="S", user="b", session="k")
     assert not isinstance(e.value, SessionLost)
     assert p.session_active("k") is True        # session left intact
 
-    limit = FakeProc("", rc=1, err="weekly limit reached; no conversation")
-    p2, _ = _cli(monkeypatch, [_OK, limit])
+    limit = {"rc": 1, "err": "weekly limit reached; no conversation"}
+    p2, _ = _cli(monkeypatch, _OK, limit)
     await p2.complete(model="opus", system="S", user="a", session="k")
     with pytest.raises(LimitExhausted):         # limit wins over the session read
         await p2.complete(model="opus", system="S", user="b", session="k")
@@ -167,7 +143,8 @@ class SessionProvider(LLMProvider):
         return self._active
 
     async def complete(self, *, model, system, user, cwd=None, params=None,
-                       session=None, effort=None):
+                       session=None, effort=None, allowed_tools=None,
+                       mcp_config=None, on_progress=None):
         self.users.append(user)
         self.sessions.append(session)
         if self._raise_lost and len(self.users) == 1:
