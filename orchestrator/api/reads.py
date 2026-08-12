@@ -21,7 +21,7 @@ from typing import Any
 METRIC_EVENT_KINDS: tuple[str, ...] = (
     "escalated", "auto_integrated", "crashed", "retrieval_exhausted",
     "visual_gate_error", "visual_gate_skipped", "no_patch",
-    "verify_unverifiable",
+    "verify_unverifiable", "asset_op_failed",
 )
 
 _CHANNEL_FIELDS = ("calls", "in_tok", "out_tok", "cache_hit", "cache_miss", "cost")
@@ -80,6 +80,19 @@ def latest_run(conn: sqlite3.Connection,
         f"SELECT * FROM runs WHERE status IN ({q}) ORDER BY started_at DESC LIMIT 1",
         statuses).fetchone()
     return dict(row) if row else None
+
+
+def run_last_activity(conn: sqlite3.Connection, run_id: str) -> float | None:
+    """Newest timestamp the run left in `events` or `usage` — the signal
+    `ops/liveness.py` measures liveness from. Mirrors `Store.run_last_activity`;
+    `tests/api/test_reads_parity.py` pins the two together."""
+    row = conn.execute(
+        """SELECT MAX(ts) t FROM (
+               SELECT MAX(ts) ts FROM events WHERE run_id=?
+               UNION ALL
+               SELECT MAX(ts) ts FROM usage  WHERE run_id=?)""",
+        (run_id, run_id)).fetchone()
+    return row["t"]
 
 
 def run_task_ids(conn: sqlite3.Connection, run_id: str) -> list[str]:

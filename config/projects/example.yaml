@@ -69,6 +69,16 @@ gate:
   commands: []            # REQUIRED, e.g. ["npm run typecheck", "npm run lint", "npm test"]
   timeout_s: 1200
 
+# Named, human-authored commands for work no LLM role can do (workers have no
+# shell by design; the planner is read-only). A spec references one BY NAME —
+# `asset_op: reduce_hero_mesh` — and it runs in the candidate worktree before the
+# gate, with its outputs committed into the candidate's diff. Same trust level as
+# gate.commands. Empty = feature off. Value is a command string, or
+# {cmd, timeout_s} when the tool needs longer than gate.timeout_s.
+asset_ops: {}
+  # reduce_hero_mesh: "npx gltf-transform simplify public/hero.glb public/hero.low.glb --ratio 0.3"
+  # bake_lightmaps: {cmd: "blender --background --python tools/bake.py", timeout_s: 3600}
+
 # Optional extra MCP servers for the planner/reviewer roles (claude_cli), e.g.
 # a live app inspector or devtools bridge specific to your project. Off by
 # default. {name: {enabled, mcp_config}}

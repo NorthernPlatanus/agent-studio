@@ -58,6 +58,7 @@ touches, and read the governing doc in docs/ for the area before finalizing.
       "risk": "low",
       "domain": "physics",
       "visual": false,
+      "asset_op": null,
       "notes_for_worker": "gotchas, ADR references, naming conventions for this task"
     }
   ]
@@ -92,6 +93,18 @@ touches, and read the governing doc in docs/ for the area before finalizing.
   cost ~800k tokens to reach a verdict that was structurally unreachable. Write
   the acceptance criterion so unit tests prove the transient (a fixed-point or
   first-frame assertion in code) and leave `visual: false`.
+- **asset_op**: the name of ONE fixed, human-authored command that must run
+  against the worktree before the gate — decimating a mesh, transcoding a
+  texture, baking an atlas. Workers cannot run tools of any kind, so a task that
+  needs one is otherwise impossible for them. Use it ONLY when the payload sent
+  with this prompt has an `ASSET OPS AVAILABLE` section, and ONLY with a name
+  listed there, copied exactly: a name that isn't in that list is rejected and
+  the whole plan fails. Never write a command line into this field, and never
+  invent a name for an op you wish existed — if the task needs a tool that isn't
+  listed, say so in `questions` (or `assumptions`) so a human can add it.
+  Omit or `null` for every other task, which is almost all of them. The op's
+  output files are committed into the candidate's diff, so list them in
+  `files_write` only if the WORKER must also edit them by hand.
 - **parent_id** when you decompose one backlog item into several specs (`T-131`
   → `T-131a`, `T-131b`): set `parent_id: "T-131"` on each child. The sub-ids have
   no line on the board, so this is what lets the run get written back to it.

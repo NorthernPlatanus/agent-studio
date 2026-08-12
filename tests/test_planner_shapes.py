@@ -1,10 +1,12 @@
 """Phase 3a: planner output parsing — object envelope, questions shape, and
 legacy bare-array back-compat."""
 
+from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
 
+from orchestrator.core.config import Config
 from orchestrator.nodes.planner import (needs_plan_ids, parse_planner_output,
                                         persist_specs, validate_spec)
 
@@ -103,7 +105,10 @@ class _Store:
 
 def _persist(specs):
     store = _Store()
-    ctx = SimpleNamespace(store=store, run_id="r")
+    # cfg: persist_specs validates `asset_op` names against the profile's
+    # configured ops (an empty map here — these specs name none).
+    cfg = Config({"asset_ops": {}, "gate": {}}, "p", Path("/tmp"))
+    ctx = SimpleNamespace(store=store, run_id="r", cfg=cfg)
     persist_specs(ctx, specs)
     return {s["id"]: s for s in store.saved}
 

@@ -327,7 +327,8 @@ def harmless_argv(monkeypatch):
     `require_repo_path`, the supervisor, the 202 body — but no orchestrator
     process is ever created.
     """
-    for name in ("run_argv", "plan_argv", "resume_argv", "import_backlog_argv"):
+    for name in ("run_argv", "plan_argv", "resume_argv", "import_backlog_argv",
+                 "reconcile_argv"):
         monkeypatch.setattr(jobs, name, lambda *a, **k: list(ECHO))
 
 
@@ -379,6 +380,50 @@ def test_a_second_job_while_one_is_in_flight_is_409(job_client, sup, job_cfg,
 def test_import_backlog_takes_no_body_at_all(job_client, harmless_argv):
     r = job_client.post(f"{BASE}/jobs/import-backlog")
     assert r.status_code == 202 and r.json()["command"] == "import-backlog"
+
+
+def test_every_spawnable_command_survives_being_serialized(job_client, sup, job_cfg,
+                                                           harmless_argv):
+    """Spawn each command and read it back, because that is the half that broke.
+
+    `reconcile` was added to the router and to `reconcile_argv` but not to the
+    `Job.command` Literal, so it spawned fine and then failed to serialize: a 500
+    on its own 202, and — because nothing is evicted on exit, and the sidecar
+    outlives a restart — a 500 on **every** `GET /jobs` for that project
+    afterwards, which the browser could only report as a CORS failure. Asserting
+    per-command 202s would not have caught it; the read-back is the test.
+    """
+    for command in jobs.COMMANDS:
+        if command == "resume":
+            continue          # needs a paused run; covered by its own test
+        body = {} if command in ("import-backlog", "reconcile") else {"confirm": True}
+        r = job_client.post(f"{BASE}/jobs/{command}", json=body)
+        assert r.status_code == 202, (command, r.status_code, r.text)
+        assert r.json()["command"] == command
+
+        listed = job_client.get(f"{BASE}/jobs")
+        assert listed.status_code == 200, (command, listed.text)
+        assert listed.json()["jobs"][0]["command"] == command
+        # One at a time, so let it go before spawning the next.
+        _wait_for(sup, sup.get(job_cfg, r.json()["job_id"]))
+
+
+def test_reconcile_never_claims_a_run_it_only_closed(sup, job_cfg, job_state):
+    """`reconcile` mints no run row, so resolving one would link a stranger's.
+
+    The match is "newest run started around when this job did" — for a job that
+    only rewrites existing rows, any hit belongs to something else the operator
+    is running, and the console would show it as this job's output.
+    """
+    record = _wait_for(sup, sup.spawn(job_cfg, "reconcile", ECHO))
+    store = job_state / f"{PROJECT}.sqlite3"
+    conn = sqlite3.connect(store)
+    with conn:
+        conn.execute("INSERT INTO runs (id, started_at, status) VALUES (?,?,?)",
+                     ("run-not-mine", record.started_at + 1, "running"))
+    conn.close()
+
+    assert sup.resolve_run_id(record, store).run_id is None
 
 
 def test_resume_spawns_when_a_paused_run_exists(job_client, harmless_argv):

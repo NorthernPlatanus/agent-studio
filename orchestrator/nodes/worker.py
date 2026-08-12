@@ -18,6 +18,7 @@ from pathlib import Path
 
 from ..core.context import RunContext
 from ..core.errors import BudgetExceeded, LimitExhausted, OrchestratorError, PatchError
+from ..ops.assetops import run_asset_op
 from ..ops.gate import ensure_deps, run_gate
 from ..ops import retrieval
 from ..ops.patch import apply_response, parse_worker_response
@@ -297,6 +298,38 @@ async def run_candidate(ctx: RunContext, payload: dict) -> dict:
             worktree,
             f"wip({task_id}): {cand_id} attempt {attempt}\n\nRefs {task_id}")
         log.info("%s/%s attempt %d: applied %s", task_id, cand_id, attempt, written)
+
+        # Deterministic asset op (ops/assetops): a named, human-authored command
+        # from the profile — same trust level as gate.commands, no LLM string in
+        # it. Runs AFTER the patch commit (so the tool sees the worker's changes)
+        # and BEFORE the gate (so the gate builds against the processed asset).
+        # Its outputs are committed here, which is what puts them in
+        # diff_against_feature and therefore in front of the reviewer and into
+        # the merge. A failure is a red gate: same status, same retry branch.
+        asset = await asyncio.to_thread(run_asset_op, worktree, ctx.cfg, spec)
+        if asset.ran:
+            # Its own kind when red (counted by `metrics`): a rising
+            # asset_op_failed means the tool or its inputs are broken, which no
+            # amount of worker retrying can fix — that has to be visible without
+            # reading candidate logs.
+            ctx.store.log_event(
+                ctx.run_id, task_id,
+                "asset_op" if asset.passed else "asset_op_failed",
+                f"{cand_id} attempt={attempt} op={asset.op} passed={asset.passed}"
+                + ("" if asset.passed else f"\n{(asset.log_tail or '')[-2000:]}"))
+        if asset.ran and not asset.passed:
+            cand["status"] = "gate_failed"
+            cand["gate_log"] = (f"[asset_op {asset.op}: {asset.cmd}]\n"
+                                f"{asset.log_tail}")
+            log.warning("%s/%s attempt %d asset_op FAILED: %s\n%s",
+                        task_id, cand_id, attempt, asset.op,
+                        (asset.log_tail or "")[-1500:])
+            return {"candidates": [cand]}
+        if asset.ran:
+            await ctx.git.acommit_all(
+                worktree,
+                f"asset({task_id}): {asset.op} for {cand_id} attempt {attempt}"
+                f"\n\nRefs {task_id}")
 
         gate = await asyncio.to_thread(run_gate, worktree, ctx.cfg)
         if gate.passed:

@@ -15,6 +15,8 @@ import uuid
 from pathlib import Path
 from typing import Any
 
+from . import liveness
+
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS tasks (
     id TEXT PRIMARY KEY,
@@ -68,6 +70,15 @@ class Store:
         self.path = str(path)
         self._conn = sqlite3.connect(self.path)
         self._conn.row_factory = sqlite3.Row
+        # WAL + a busy timeout, because this file has never had exactly one
+        # writer: a CLI run, a `reconcile`, and the panel's discuss session are
+        # separate processes that can overlap. In the default rollback journal a
+        # reader blocks a writer outright; in WAL they don't block each other, and
+        # the timeout turns the remaining writer-writer overlap into a wait rather
+        # than an immediate `database is locked`. Both pragmas are no-ops when
+        # already set — journal_mode is a persistent property of the file.
+        self._conn.execute("PRAGMA journal_mode=WAL")
+        self._conn.execute("PRAGMA busy_timeout=5000")
         self._conn.executescript(SCHEMA)
         self._migrate()
         self._conn.commit()
@@ -162,6 +173,54 @@ class Store:
             f"SELECT * FROM runs WHERE status IN ({q}) ORDER BY started_at DESC LIMIT 1",
             statuses).fetchone()
         return dict(row) if row else None
+
+    def run_last_activity(self, run_id: str) -> float | None:
+        """Newest timestamp the run left anywhere, or None if it left nothing.
+
+        `runs` records only `started_at`, so a run's own footprint is the union of
+        the two tables it writes as it works. See `ops/liveness.py` for why this,
+        and not a pid, is what liveness is measured from.
+        """
+        row = self._conn.execute(
+            """SELECT MAX(ts) t FROM (
+                   SELECT MAX(ts) ts FROM events WHERE run_id=?
+                   UNION ALL
+                   SELECT MAX(ts) ts FROM usage  WHERE run_id=?)""",
+            (run_id, run_id)).fetchone()
+        return row["t"]
+
+    def abandoned_runs(self, *, after_s: float = liveness.STALE_AFTER_S) -> list[dict]:
+        """`running` rows whose process is long gone (`ops/liveness.py`)."""
+        rows = self._conn.execute(
+            f"SELECT * FROM runs WHERE status IN ({','.join('?' for _ in liveness.LIVE_STATUSES)})"
+            " ORDER BY started_at",
+            liveness.LIVE_STATUSES).fetchall()
+        now = time.time()
+        out = []
+        for row in rows:
+            last = self.run_last_activity(row["id"]) or row["started_at"]
+            if liveness.is_stale(row["status"], last, now=now, after_s=after_s):
+                run = dict(row)
+                run["last_activity_at"] = last
+                out.append(run)
+        return out
+
+    def abort_abandoned_runs(self, *, after_s: float = liveness.STALE_AFTER_S) -> list[dict]:
+        """Give every abandoned run the terminal status its process never wrote.
+
+        `aborted`, not `failed`: nothing is known about whether the work was going
+        well when the process died, only that it stopped. The note records how
+        long the silence was so the row still explains itself later.
+        """
+        abandoned = self.abandoned_runs(after_s=after_s)
+        now = time.time()
+        for run in abandoned:
+            silent_h = (now - run["last_activity_at"]) / 3600
+            self.set_run_status(
+                run["id"], "aborted",
+                note=f"reconciled: no store activity for {silent_h:.1f}h "
+                     f"— the process is gone")
+        return abandoned
 
     # ---- usage / budget --------------------------------------------------
     def record_usage(self, run_id: str | None, task_id: str | None, role: str,
