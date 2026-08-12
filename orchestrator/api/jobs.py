@@ -36,18 +36,25 @@ import threading
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
+from typing import get_args
 
 from fastapi import HTTPException
 
 from ..core.config import Config
-from . import deps
+from . import deps, schemas
 
-# `import-backlog` is free; the other three spend subscription quota (or, for a
-# dry run, nothing) and are confirm-gated in the request models.
+# `import-backlog` and `reconcile` are free; the other three spend subscription
+# quota (or, for a dry run, nothing) and are confirm-gated in the request models.
+# Derived from the response Literal rather than restated, because a second hand-
+# written list is exactly how `reconcile` came to be spawnable but not
+# serializable — a 500 on its own 202, and on every `GET /jobs` after it.
 JobCommand = str
-COMMANDS: tuple[str, ...] = ("run", "plan", "resume", "import-backlog")
+COMMANDS: tuple[str, ...] = get_args(schemas.JobCommandName)
 
 LIVE_STATUSES: tuple[str, ...] = ("starting", "running")
+
+#: Commands that never mint a run row, so `resolve_run_id` must not go looking.
+RUNLESS_COMMANDS: frozenset[str] = frozenset({"import-backlog", "reconcile"})
 
 # Job ids become filenames, so they are minted (never accepted) and re-validated
 # before any path join — the same defensive second line as `deps._SAFE_NAME`.
@@ -148,6 +155,13 @@ def resume_argv(project: str) -> list[str]:
 
 def import_backlog_argv(project: str) -> list[str]:
     return _base("import-backlog", project)
+
+
+def reconcile_argv(project: str, *, dry_run: bool = False) -> list[str]:
+    argv = _base("reconcile", project)
+    if dry_run:
+        argv.append("--dry-run")
+    return argv
 
 
 # ---- the supervisor ------------------------------------------------------
@@ -377,8 +391,13 @@ class JobSupervisor:
         Safe to call on every list poll: it returns immediately once the id is
         known, and `run_id_settled` stops it re-querying a finished job that
         never produced a run (a crash before the first write, or `import-backlog`).
+
+        `reconcile` is excluded for the same reason as `import-backlog`, and for
+        one more: it only ever *closes* runs, so the newest row started near its
+        own start time belongs to whoever the operator is actually running — the
+        match would be an outright wrong link, not just a useless one.
         """
-        if (record.run_id or record.command == "import-backlog"
+        if (record.run_id or record.command in RUNLESS_COMMANDS
                 or record.run_id_settled):
             return record
         if store_path is None or not store_path.exists():

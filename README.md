@@ -219,6 +219,21 @@ verification or cheap attempts for subscription quota.
 protocol excerpt (`domains:` in the profile). This is a specialization layer;
 the scheduler still enforces files_write-disjointness regardless of domain.
 
+**Asset ops** (optional, `asset_ops:`): some tasks need a real binary-processing
+tool run against a file — decimating a `.glb` with gltf-transform, transcoding a
+texture — and no LLM role here can do that: workers are patch-only with no shell
+*by design*, and the planner/reviewer tier is Read/Grep/Glob. So the commands are
+**named, human-authored and fixed** in the profile, at the same trust level as
+`gate.commands`, and a spec references one **by name** (`asset_op:
+reduce_model_poly`). The name is the only part an LLM ever writes; an unknown name
+is rejected at plan time and, if it somehow reaches a candidate, fails it rather
+than silently doing nothing. The op runs once per attempt in the candidate's own
+worktree, after the worker's patch commit and before the gate (so the gate builds
+against the processed asset), and its outputs are committed into the candidate's
+diff for review and merge. A non-zero exit or a timeout fails the candidate
+exactly like a red gate, counted as `asset_op_failed` in `metrics`. Empty by
+default — no entries and no spec naming one is a no-op.
+
 **Visual gate** (optional, `visual_gate.enabled`): for `visual: true` specs, a
 green gate isn't enough ("compiles" ≠ "renders"). The gate optionally starts the
 app in the worktree (`run_cmd`, polled until `ready_probe` answers), runs
@@ -331,6 +346,7 @@ orchestrator/
     retrieval.py          read-only grep/read/ls executors for workers
     projectmap.py         structural project index (tree + symbols)
     visualgate.py         scene-graph assertions + safe evaluator
+    assetops.py           named human-authored asset commands (no LLM shell)
     gate.py budget.py     project self-checks, usage ledger + caps
   providers/              claude_cli / codex_cli (subscription) / openai_compatible
   nodes/                  planner, discuss, worker, reviewer, integrator

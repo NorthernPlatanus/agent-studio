@@ -14,7 +14,7 @@ import logging
 import re
 
 from ..ops.backlog import make_backlog, parent_id as derive_parent_id
-from ..ops import projectmap
+from ..ops import assetops, projectmap
 from ..core.context import RunContext
 from ..core.errors import PlannerNeedsInput, SessionLost
 from ..providers import get_provider
@@ -84,6 +84,19 @@ def _full_prompt(ctx: RunContext, *, discussion: str, transcript: str,
     if map_file.exists():
         parts += ["# PROJECT MAP (structure — verify against it before listing files)",
                   map_file.read_text()[:20000], ""]
+    # The available asset ops, verbatim. The planner may set `asset_op: <name>`
+    # on a spec, and this list is the only place those names exist — it cannot
+    # invent one (persist_specs rejects unknown names) and it cannot guess one
+    # that was never shown. Omitted entirely when the project configures none, so
+    # a profile without asset ops sends not one extra token.
+    ops = assetops.available_ops(ctx.cfg)
+    if ops:
+        parts += ["# ASSET OPS AVAILABLE (fixed commands; reference BY NAME via "
+                  "`asset_op`, never write a command yourself)"]
+        for name in ops:
+            cmd, _ = assetops.resolve_op(ctx.cfg, name)
+            parts.append(f"- {name}: `{cmd}`")
+        parts.append("")
     if existing:
         parts += ["# CURRENTLY PLANNED SPECS (update, don't duplicate)",
                   json.dumps(existing, indent=1)[:20000], ""]
@@ -104,7 +117,9 @@ def session_reuse_enabled(cfg) -> bool:
 
 async def plan_or_ask(ctx: RunContext, *, discussion: str = "", transcript: str = "",
                       only_ids: list[str] | None = None,
-                      session: str | None = None, delta: str = "") -> dict:
+                      session: str | None = None, delta: str = "",
+                      effort: str | None = None, model: str | None = None,
+                      session_reuse: bool | None = None) -> dict:
     """One planner turn. Returns the normalized envelope
     {questions, assumptions, specs} WITHOUT persisting — so `discuss` can loop
     and `plan` can decide what to do with questions. `transcript` carries the
@@ -117,19 +132,28 @@ async def plan_or_ask(ctx: RunContext, *, discussion: str = "", transcript: str 
     weight, against the subscription tier that is the binding constraint. When
     the provider reports the session is live, only `delta` (the human's new
     answer) is sent and the conversation supplies the rest. If the resume fails,
-    SessionLost brings us back here and the full payload goes out once."""
-    provider_name, model = ctx.role_target("planner")
+    SessionLost brings us back here and the full payload goes out once.
+
+    `effort`/`model`/`session_reuse` override the configured planner target for
+    this call only. They exist for `discuss`, where an operator adjusts the tier
+    mid-conversation — a hard question deserves `high`, and the rest of the
+    session should not pay for it. None means "leave the config alone", so every
+    other caller is unaffected."""
+    provider_name, configured_model = ctx.role_target("planner")
+    model = model or configured_model
     provider = get_provider(ctx.cfg, provider_name)
     system = ctx.cfg.prompt("planner")
 
-    use_session = session if session_reuse_enabled(ctx.cfg) else None
+    reuse = (session_reuse_enabled(ctx.cfg) if session_reuse is None
+             else session_reuse)
+    use_session = session if reuse else None
     continuing = bool(use_session and delta and provider.session_active(use_session))
     user = (f"# HUMAN REPLY — continue the plan from our conversation\n{delta}"
             if continuing else
             _full_prompt(ctx, discussion=discussion, transcript=transcript,
                          only_ids=only_ids))
 
-    effort = ctx.role_effort("planner")
+    effort = effort or ctx.role_effort("planner")
     try:
         result = await provider.complete(model=model, system=system, user=user,
                                          cwd=str(ctx.cfg.repo_path()),
@@ -154,7 +178,7 @@ async def plan_or_ask(ctx: RunContext, *, discussion: str = "", transcript: str 
     return parse_planner_output(result.text)
 
 
-def validate_spec(spec: dict) -> None:
+def validate_spec(spec: dict, asset_ops: list[str] | None = None) -> None:
     """Reject a spec the executor cannot run, at PLAN time, with a message the
     planner can act on. Raises ValueError.
 
@@ -166,6 +190,12 @@ def validate_spec(spec: dict) -> None:
       * empty list  -> every write is rejected, so the task can never go green;
         it burns the full retry ladder (and the scheduler runs it alone in a
         batch of one) before failing for a reason no log makes obvious.
+    `asset_op` is checked against the profile's configured names when
+    `asset_ops` is passed. The op is a fixed human-authored command and the name
+    is the ONLY part the planner writes, so a name that doesn't exist is a typo
+    or a hallucination — caught here, at plan time, rather than failing every
+    candidate of that task later for a reason the retry feedback can't fix.
+
     Human-only specs (`agent_able: false`) never reach a worker, so they are
     exempt."""
     for key in ("id", "title", "description"):
@@ -173,6 +203,14 @@ def validate_spec(spec: dict) -> None:
             raise ValueError(f"Planner spec missing '{key}': {spec}")
     if not spec.get("agent_able", True):
         return
+    asset_op = spec.get("asset_op")
+    if asset_op and asset_ops is not None and asset_op not in asset_ops:
+        raise ValueError(
+            f"Planner spec {spec['id']} names an unknown asset_op "
+            f"{asset_op!r}. Asset ops are fixed commands defined by a human in "
+            f"the project profile; the available names are: "
+            f"{', '.join(asset_ops) or '(none configured)'}. Use one of those, "
+            f"or drop the field.")
     files_write = spec.get("files_write")
     if files_write is None:
         raise ValueError(
@@ -188,8 +226,9 @@ def validate_spec(spec: dict) -> None:
 
 def persist_specs(ctx: RunContext, specs: list[dict], note: str = "") -> list[dict]:
     """Validate + upsert planner specs. Shared by `plan` and `discuss`."""
+    asset_ops = assetops.available_ops(ctx.cfg)
     for spec in specs:
-        validate_spec(spec)
+        validate_spec(spec, asset_ops=asset_ops)
         # The planner sees current specs (which carry queue status) and may
         # echo the field back — never let LLM output overwrite queue state.
         spec.pop("status", None)

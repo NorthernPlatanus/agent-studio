@@ -91,3 +91,10 @@ def test_latest_run_parity(store, ro_conn):
     assert reads.latest_run(ro_conn) == store.latest_run()
     assert (reads.latest_run(ro_conn, ("paused",))
             == store.latest_run(statuses=("paused",)))
+
+
+@pytest.mark.parametrize("run_id", [RUN_DONE, RUN_PAUSED, "no-such-run"])
+def test_run_last_activity_parity(store, ro_conn, run_id):
+    """The liveness signal is read on both sides — the API annotates `stale`,
+    `reconcile` acts on it — so the two queries must not drift apart."""
+    assert reads.run_last_activity(ro_conn, run_id) == store.run_last_activity(run_id)

@@ -8,6 +8,7 @@ Commands:
   status          queue, budgets, and cost breakdown
   metrics         solve rate, escalation frequency, subscription tokens/task
   import-backlog  register backlog items as stubs (no LLM)
+  reconcile       close out runs whose process died mid-flight (no LLM)
   serve           control-panel HTTP API (read layer + job control), localhost only
 """
 
@@ -18,6 +19,7 @@ import asyncio
 import logging
 import os
 import sys
+import time
 
 from .engine import runner
 from .core.config import load_config
@@ -26,6 +28,7 @@ from .nodes.discuss import run_discuss
 from .nodes.planner import (import_backlog_stubs, needs_plan_ids as plan_batch_ids,
                             plan)
 from .engine.scheduler import queue_stats
+from .ops import liveness
 from .ops.store import Store
 
 
@@ -91,6 +94,15 @@ def build_parser() -> argparse.ArgumentParser:
     p = sub.add_parser("import-backlog", help="register backlog items as stubs (no LLM)")
     _add_common(p)
 
+    p = sub.add_parser("reconcile", help="close out runs whose process died without "
+                                         "writing a terminal status (no LLM)")
+    _add_common(p)
+    p.add_argument("--dry-run", action="store_true",
+                   help="list what would be closed and change nothing")
+    p.add_argument("--after-minutes", type=int, default=int(liveness.STALE_AFTER_S // 60),
+                   help="how long a 'running' run may be silent before it counts as "
+                        "abandoned (default: %(default)s)")
+
     p = sub.add_parser("serve", help="run the control-panel HTTP API (localhost only)")
     _add_common(p)
     p.add_argument("--host", default="127.0.0.1",
@@ -116,7 +128,7 @@ def _print_metrics(store) -> None:
     counts = store.event_counts(("escalated", "auto_integrated", "crashed",
                                  "retrieval_exhausted", "visual_gate_error",
                                  "visual_gate_skipped", "no_patch",
-                                 "verify_unverifiable"))
+                                 "verify_unverifiable", "asset_op_failed"))
     print(f"\nqueue: {queue_stats(tasks)}")
     for kind in sorted(counts):
         print(f"  {kind:<22} {counts[kind]}")
@@ -226,6 +238,24 @@ def main(argv: list[str] | None = None) -> int:
         n = import_backlog_stubs(ctx)
         print(f"imported {n} new backlog items as stubs (status: needs_plan). "
               f"Run `plan` to enrich them into executable specs.")
+        return 0
+
+    if args.command == "reconcile":
+        store = Store(cfg.store_path())
+        after_s = max(args.after_minutes, 0) * 60
+        abandoned = store.abandoned_runs(after_s=after_s)
+        if not abandoned:
+            print("nothing to reconcile: every 'running' run has been active recently")
+            return 0
+        for run in abandoned:
+            silent_h = (time.time() - run["last_activity_at"]) / 3600
+            print(f"  {run['id']}  silent {silent_h:.1f}h  "
+                  f"{'(would close)' if args.dry_run else '-> aborted'}")
+        if args.dry_run:
+            print(f"{len(abandoned)} run(s) would be closed. Re-run without --dry-run.")
+            return 0
+        store.abort_abandoned_runs(after_s=after_s)
+        print(f"closed {len(abandoned)} abandoned run(s) as aborted.")
         return 0
 
     if args.command == "serve":

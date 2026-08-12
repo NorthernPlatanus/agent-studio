@@ -26,10 +26,11 @@ from ...core.config import Config
 from .. import jobs as supervisor_mod
 from .. import reads
 from ..deps import require_repo_path, resolve_project, store_conn, store_path
+from ..discuss import DiscussManager, get_manager
 from ..errors import JOB_READ_ERRORS, JOB_SPAWN_ERRORS, PROJECT_ERRORS
 from ..jobs import JobError, JobRecord, JobSupervisor, get_supervisor
 from ..schemas import (ImportBacklogRequest, Job, JobAccepted, JobLog, Jobs,
-                       PlanRequest, ResumeRequest, RunRequest)
+                       PlanRequest, ReconcileRequest, ResumeRequest, RunRequest)
 
 # No 409 here, unlike the read routers: jobs are supervised processes, not store
 # rows, so a project with no state/<p>.sqlite3 still has an (empty) job list.
@@ -50,10 +51,19 @@ def _accepted(record: JobRecord) -> JobAccepted:
                        command=record.command, argv=record.argv, run_id=record.run_id)
 
 
-def _spawn(sup: JobSupervisor, cfg: Config, command: str,
-           argv: list[str]) -> JobAccepted:
-    """The shared precondition + spawn path for all four commands."""
+def _spawn(sup: JobSupervisor, cfg: Config, command: str, argv: list[str],
+           manager: DiscussManager) -> JobAccepted:
+    """The shared precondition + spawn path for every command."""
     require_repo_path(cfg)
+    # The other half of the one-writer rule. A discuss session is an in-process
+    # asyncio task (PLAN §3.3) that writes the transcript, planner usage and, on
+    # approval, the specs themselves — to the same sqlite file this subprocess is
+    # about to open. `start_discuss` refuses the mirror case.
+    open_session = manager.active(cfg.project_name)
+    if open_session is not None:
+        raise JobError(409, f"a discuss session ({open_session.session_id}) is open "
+                            f"for {cfg.project_name!r} and writes to the same store "
+                            f"— close it first")
     return _accepted(sup.spawn(cfg, command, argv))
 
 
@@ -99,21 +109,23 @@ def get_job_log(job_id: str, offset: int = Query(0, ge=0),
              status_code=status.HTTP_202_ACCEPTED)
 def start_run(body: RunRequest = Body(...),
               cfg: Config = Depends(resolve_project),
-              sup: JobSupervisor = Depends(get_supervisor)) -> JobAccepted:
+              sup: JobSupervisor = Depends(get_supervisor),
+              manager: DiscussManager = Depends(get_manager)) -> JobAccepted:
     argv = supervisor_mod.run_argv(cfg.project_name, tasks=body.tasks, n=body.n,
                                    dry_run=body.dry_run)
-    return _spawn(sup, cfg, "run", argv)
+    return _spawn(sup, cfg, "run", argv, manager)
 
 
 @router.post("/jobs/plan", response_model=JobAccepted, responses=JOB_SPAWN_ERRORS,
              status_code=status.HTTP_202_ACCEPTED)
 def start_plan(body: PlanRequest = Body(...),
                cfg: Config = Depends(resolve_project),
-               sup: JobSupervisor = Depends(get_supervisor)) -> JobAccepted:
+               sup: JobSupervisor = Depends(get_supervisor),
+               manager: DiscussManager = Depends(get_manager)) -> JobAccepted:
     argv = supervisor_mod.plan_argv(cfg.project_name, tasks=body.tasks,
                                     all_needs_plan=body.all_needs_plan,
                                     limit=body.limit, note=body.note)
-    return _spawn(sup, cfg, "plan", argv)
+    return _spawn(sup, cfg, "plan", argv, manager)
 
 
 @router.post("/jobs/resume", response_model=JobAccepted, responses=JOB_SPAWN_ERRORS,
@@ -121,7 +133,8 @@ def start_plan(body: PlanRequest = Body(...),
 def start_resume(body: ResumeRequest = Body(...),
                  cfg: Config = Depends(resolve_project),
                  conn: sqlite3.Connection = Depends(store_conn),
-                 sup: JobSupervisor = Depends(get_supervisor)) -> JobAccepted:
+                 sup: JobSupervisor = Depends(get_supervisor),
+                 manager: DiscussManager = Depends(get_manager)) -> JobAccepted:
     # Checked here as well as in the CLI so the UI can grey the button out: the
     # subprocess would print "no paused run to resume" and exit 1, which the
     # panel could only report as a failed job after the fact.
@@ -129,7 +142,8 @@ def start_resume(body: ResumeRequest = Body(...),
     if paused is None:
         raise JobError(404, f"no paused run to resume in project "
                             f"{cfg.project_name!r}")
-    return _spawn(sup, cfg, "resume", supervisor_mod.resume_argv(cfg.project_name))
+    return _spawn(sup, cfg, "resume", supervisor_mod.resume_argv(cfg.project_name),
+                  manager)
 
 
 @router.post("/jobs/import-backlog", response_model=JobAccepted,
@@ -137,9 +151,27 @@ def start_resume(body: ResumeRequest = Body(...),
 def start_import_backlog(
         body: ImportBacklogRequest = Body(default_factory=ImportBacklogRequest),
         cfg: Config = Depends(resolve_project),
-        sup: JobSupervisor = Depends(get_supervisor)) -> JobAccepted:
+        sup: JobSupervisor = Depends(get_supervisor),
+        manager: DiscussManager = Depends(get_manager)) -> JobAccepted:
     argv = supervisor_mod.import_backlog_argv(cfg.project_name)
-    return _spawn(sup, cfg, "import-backlog", argv)
+    return _spawn(sup, cfg, "import-backlog", argv, manager)
+
+
+@router.post("/jobs/reconcile", response_model=JobAccepted,
+             responses=JOB_SPAWN_ERRORS, status_code=status.HTTP_202_ACCEPTED)
+def start_reconcile(
+        body: ReconcileRequest = Body(default_factory=ReconcileRequest),
+        cfg: Config = Depends(resolve_project),
+        sup: JobSupervisor = Depends(get_supervisor),
+        manager: DiscussManager = Depends(get_manager)) -> JobAccepted:
+    """Close out runs whose process died without writing a terminal status.
+
+    Free and confirm-less, like `import-backlog`: it calls no provider and touches
+    no git. It writes to the store, which is exactly why it is a spawned CLI job
+    rather than an API-side update — the API stays read-only (PLAN §3.1 rule 2).
+    """
+    argv = supervisor_mod.reconcile_argv(cfg.project_name, dry_run=body.dry_run)
+    return _spawn(sup, cfg, "reconcile", argv, manager)
 
 
 # ---- stop ----------------------------------------------------------------

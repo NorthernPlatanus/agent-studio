@@ -175,6 +175,31 @@ gate:
   timeout_s: 1200
   log_tail_chars: 6000   # failure log tail shown to the worker on retry
 
+# Deterministic asset operations (ops/assetops.py). NAMED, HUMAN-AUTHORED, FIXED
+# commands — the same trust level as gate.commands, never an LLM-generated string.
+#
+# They exist because some tasks need a real external binary-processing tool run
+# against a file no LLM role can touch (decimate a .glb, transcode a texture,
+# bake an atlas): the worker is patch-only with no shell BY DESIGN, and the
+# planner/reviewer tier is Read/Grep/Glob. Rather than hand either of them shell,
+# you write the command here and a spec references it BY NAME (`asset_op: <key>`).
+# The name is the only part an LLM ever authors, and an unknown name fails the
+# candidate loudly (plan-time validation rejects it earlier still).
+#
+# The command runs once per attempt, in the candidate's own worktree, after the
+# worker's patch is committed and before the gate. Its outputs are committed, so
+# they are part of the candidate's diff for review and merge. A non-zero exit or
+# a timeout fails the candidate exactly like a red gate.
+#
+# An entry is a bare command string, or {cmd, timeout_s} when the tool is not on
+# the gate's timescale (timeout_s defaults to gate.timeout_s):
+#   asset_ops:
+#     reduce_model_poly: "npx @gltf-transform/cli simplify in.glb out.glb --ratio 0.3"
+#     bake_lightmaps: {cmd: "blender --background --python bake.py", timeout_s: 3600}
+#
+# Empty by default: with no entries and no spec naming one, this is a no-op.
+asset_ops: {}
+
 review:
   # The reviewer prompts demand a scorecard, so a missing one is a malformed
   # verdict, not an implicit "no objection": an `approve` with no `scores` is
