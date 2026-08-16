@@ -3,7 +3,7 @@
 Configuration is built EXPLICITLY here. `tests/conftest.py` deletes every `ORCH_*`
 variable for the whole session, so the `ORCH_PATHS_STATE_DIR` trick that isolates
 an out-of-process server silently does nothing inside pytest — a test that relied
-on it would look isolated while reading the user's real `state/demo-project.sqlite3`.
+on it would look isolated while reading the operator's real store.
 So: copy the `example` profile's config, point `paths.state_dir` at a tmpdir, and
 inject it through `deps.get_registry`.
 """
@@ -47,7 +47,7 @@ def cfg(state_dir: Path) -> Config:
 @pytest.fixture(scope="session")
 def registry(cfg: Config) -> deps.ProjectRegistry:
     # root=state_dir: an empty tree, so the allowlist is exactly the injected
-    # project and no test can reach the real `projects/demo-project` profile.
+    # project and no test can reach a real profile under `projects/`.
     return deps.ProjectRegistry(root=Path(cfg.paths.state_dir),
                                 configs={PROJECT: cfg})
 

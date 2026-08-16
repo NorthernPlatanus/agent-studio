@@ -104,6 +104,6 @@ def test_unknown_project_is_404(client):
 
 def test_traversal_in_the_project_name_is_404(client):
     # %2F survives into the path parameter, so `project` really is "../etc" here.
-    for name in ("%2E%2E%2Fetc", "%2E%2E", "demo-project"):
+    for name in ("%2E%2E%2Fetc", "%2E%2E", "not-in-the-allowlist"):
         r = client.get(f"/api/projects/{name}/summary")
         assert r.status_code == 404, (name, r.status_code)

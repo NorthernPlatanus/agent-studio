@@ -51,13 +51,14 @@ def parse_planner_output(text: str) -> dict:
     raise ValueError(f"Planner returned no JSON array/object:\n{text[:1000]}")
 
 
-#: How much of a COMPLETED item's line survives. Measured on demo-project's board:
-#: the 19 done items are 15,756 chars — 48% of the whole backlog — averaging 829
-#: chars each, because a finished item accumulates its own completion write-up
-#: ("**Done** — see ADR-0031. `features/ghost/model` (pure): records ..."). The
-#: 17 items actually awaiting a plan total 2,704 chars. So half the most
-#: expensive block in the prompt is implementation archaeology about work that
-#: is finished, re-sent on every planner turn.
+#: How much of a COMPLETED item's line survives. Measured on a pre-alpha test
+#: board of a few dozen items: the done ones account for roughly half the whole
+#: backlog by volume, averaging ~800 chars each, because a finished item
+#: accumulates its own completion write-up ("**Done** — see ADR-0031.
+#: `features/ghost/model` (pure): records ..."), while the items actually
+#: awaiting a plan are a fraction of that. So half the most expensive block in
+#: the prompt is implementation archaeology about work that is finished,
+#: re-sent on every planner turn.
 #:
 #: What the planner needs from a done item is that it EXISTS, so it can reason
 #: about dependencies and not re-plan it. The detail is still in the file, and
@@ -152,9 +153,9 @@ SLIM_SPEC_FIELDS = ("id", "title", "status", "milestone", "deps", "files_write",
                     "parent_id", "agent_able")
 
 #: Titles are clamped in the SLIM form only. `title` is nominally a short
-#: imperative phrase, but nothing enforces that and the field drifts: on the
-#: demo-project board the longest is 4,146 characters of prose that belongs in
-#: `description`. Unclamped, three such entries can consume the whole block's
+#: imperative phrase, but nothing enforces that and the field drifts: on a
+#: pre-alpha test board the longest observed is ~4,000 characters of prose that
+#: belongs in `description`. Unclamped, three such entries consume the block's
 #: budget and push every other id out of view — which is the one failure this
 #: block exists to prevent. A promoted spec still carries its title in full.
 SLIM_TITLE_CHARS = 120
@@ -442,8 +443,8 @@ def needs_plan_ids(store, limit: int | None = None) -> list[str]:
     """Every task still awaiting a spec — the batch for `plan --all-needs-plan`.
 
     Planner cost scales with the number of `plan` INVOCATIONS, not with the number
-    of tasks planned. Measured on demo-project from the CLI's own session log
-    (5 API calls, one operator message, 2026-08-13):
+    of tasks planned. Measured on a pre-alpha test run, from the CLI's own
+    session log (5 API calls, one operator message):
 
         first-call payload   47,368 tok   backlog + map + specs + system prompt
         tool exploration     32,877 tok   9 tool calls

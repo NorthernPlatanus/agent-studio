@@ -183,7 +183,7 @@ cache-creation / cache-read buckets — and `status` prints both plus a hit rate
 
 **Session reuse** (`run.session_reuse`, on by default): a `discuss` loop
 otherwise re-sends backlog + project map + every current spec on every turn.
-Measured on demo-project, that payload is 47k tokens, and because the agentic loop
+Measured on a pre-alpha test run, that payload is 47k tokens, and because the agentic loop
 re-sends its prefix at every step one operator message billed 326k input tokens.
 With reuse on, the Claude CLI planner pins one session (`--session-id`) and
 continues it (`--resume`), so later turns send only the human's new answer.
@@ -205,8 +205,9 @@ still warm and resumable.
 
 **Payload budgets**: the planner prompt is assembled to fit, never sliced.
 Completed backlog items are collapsed to their id, a 160-char head, and any
-cross-references rescued from the dropped tail (on demo-project: 33k → 21k chars,
-with all 40 ids and every open item byte-identical). The current-specs block
+cross-references rescued from the dropped tail (on a pre-alpha test board:
+33k → 21k chars, with every id and every open item byte-identical). The
+current-specs block
 lists every spec in slim form first — an id the planner cannot see is an id it
 will reuse — then spends leftover budget promoting the in-play ones to full
 detail, so the block is always valid JSON.
