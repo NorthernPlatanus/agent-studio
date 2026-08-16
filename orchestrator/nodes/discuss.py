@@ -39,6 +39,7 @@ from dataclasses import dataclass, field
 
 from ..core.context import RunContext
 from ..core.errors import LimitExhausted, PlannerNeedsInput, SessionLost
+from ..ops import handoff
 from ..providers import get_provider
 from .planner import persist_specs, plan_or_ask
 
@@ -49,11 +50,13 @@ log = logging.getLogger("orchestrator.discuss")
 class PinnedFile:
     """A file the operator sent, to sit in front of the planner every turn.
 
-    The planner has `Read`/`Grep`/`Glob` and finds most things itself, at ~400k
-    tokens of exploration per invocation. Pinning is the cheap override for the
+    The planner has `Read`/`Grep`/`Glob` and finds most things itself — measured,
+    ~33k tokens of exploration across 9 tool calls on a real turn, not the ~400k
+    an earlier version of this note claimed. Pinning is the cheap override for the
     cases where it looks in the wrong place, or where the thing it needs is not
     in the checkout at all: a crash log, a spec, notes pasted out of a tracker.
-    The content is in the prompt, so it costs its own length once per turn.
+    The content is in the prompt, so it costs its own length once per turn — and
+    on a resumed turn only the FIRST time (see `sent_pins` in run_discuss).
 
     Content only — never a path into the checkout. `path` is a display name the
     API assigns under `uploaded/`, and the prompt says so, because the heading
@@ -91,18 +94,22 @@ class DiscussSettings:
     max_question_rounds: int = 0
 
     def context_block(self) -> str:
-        if not self.pinned:
-            return ""
-        # The "not in the checkout" line is not decoration: each heading below
-        # looks like a path, and without it the planner spends a turn trying to
-        # open files that exist only in this prompt.
-        parts = ["# ATTACHED FILES (the operator sent these — read them before "
-                 "searching for anything else. They were uploaded, and are not "
-                 "files in the checkout: do not try to open these paths)"]
-        for pin in self.pinned:
-            suffix = "  [truncated — only the head is here]" if pin.truncated else ""
-            parts.append(f"\n## {pin.path}{suffix}\n{pin.text}")
-        return "\n".join(parts)
+        return pins_block(self.pinned)
+
+
+def pins_block(pins: list[PinnedFile]) -> str:
+    if not pins:
+        return ""
+    # The "not in the checkout" line is not decoration: each heading below
+    # looks like a path, and without it the planner spends a turn trying to
+    # open files that exist only in this prompt.
+    parts = ["# ATTACHED FILES (the operator sent these — read them before "
+             "searching for anything else. They were uploaded, and are not "
+             "files in the checkout: do not try to open these paths)"]
+    for pin in pins:
+        suffix = "  [truncated — only the head is here]" if pin.truncated else ""
+        parts.append(f"\n## {pin.path}{suffix}\n{pin.text}")
+    return "\n".join(parts)
 
 
 def _default_settings() -> DiscussSettings:
@@ -193,6 +200,15 @@ async def run_discuss(ctx: RunContext, initial: str, *,
     llm_session = f"discuss:{ctx.run_id}"
     delta = ""
     question_rounds = 0
+    # What the live session has already been shown. `settings` is re-consulted
+    # every turn precisely so an operator can attach a file or change the note
+    # MID-conversation — but a resumed turn sends only `delta`, so anything new
+    # that arrives through settings would be silently dropped on the floor. These
+    # two track what has actually been delivered, and the difference rides along
+    # with the next delta. Updated only after a turn succeeds: a failed turn ends
+    # the session, and the full payload that follows carries everything anyway.
+    sent_pins: set[str] = set()
+    sent_note = ""
 
     while True:
         opts = current()
@@ -207,11 +223,22 @@ async def run_discuss(ctx: RunContext, initial: str, *,
         # failure on turn 1 persisted nothing at all, and the operator restarted
         # the conversation from their first message.
         ctx.store.save_discussion(session, _format(turns))
+        # Anything the operator changed since the last delivered turn. Appended to
+        # the delta so it survives a resumed turn; harmlessly ignored on a cold
+        # one, where `transcript` and `discussion` already carry it in full.
+        carry = []
+        new_pins = [p for p in opts.pinned if p.path not in sent_pins]
+        if new_pins:
+            carry.append(pins_block(new_pins))
+        if opts.note and opts.note != sent_note:
+            carry.append(f"# HUMAN NOTE — fold this into the plan\n{opts.note}")
+        send_delta = "\n\n".join([delta, *carry]) if delta else delta
         say({"kind": "thinking"})
         try:
             env = await plan_or_ask(ctx, discussion=opts.note, transcript=transcript,
                                     only_ids=opts.only_ids, session=llm_session,
-                                    delta=delta, effort=opts.effort, model=opts.model,
+                                    delta=send_delta, effort=opts.effort,
+                                    model=opts.model,
                                     session_reuse=opts.session_reuse,
                                     on_progress=lambda e: say({"kind": "progress", **e}))
         except (PlannerNeedsInput, SessionLost):
@@ -283,6 +310,10 @@ async def run_discuss(ctx: RunContext, initial: str, *,
                 delta = answer
             continue
 
+        # Delivered. Anything added from here on is "new" again.
+        sent_pins.update(p.path for p in opts.pinned)
+        sent_note = opts.note
+
         capped = (opts.max_question_rounds > 0
                   and question_rounds >= opts.max_question_rounds)
         if env["questions"] and not capped:
@@ -331,11 +362,13 @@ async def run_discuss(ctx: RunContext, initial: str, *,
             write(f"applied {len(specs)} spec(s).")
             say({"kind": "applied", "count": len(specs), "specs": specs})
             _end_session(ctx, llm_session)
+            handoff.clear(ctx)      # concluded: nothing left to bridge
             return specs
         if choice in ("abort", "a", "n", "no"):
             write("aborted — nothing applied.")
             say({"kind": "aborted"})
             _end_session(ctx, llm_session)
+            handoff.clear(ctx)
             return []
         # Anything else is the revision. Two forms, because two callers:
         #

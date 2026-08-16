@@ -15,7 +15,7 @@ import re
 from collections.abc import Callable
 
 from ..ops.backlog import make_backlog, parent_id as derive_parent_id
-from ..ops import assetops, projectmap
+from ..ops import assetops, handoff, projectmap
 from ..core.context import RunContext
 from ..core.errors import PlannerNeedsInput, SessionLost
 from ..providers import get_provider
@@ -51,6 +51,67 @@ def parse_planner_output(text: str) -> dict:
     raise ValueError(f"Planner returned no JSON array/object:\n{text[:1000]}")
 
 
+#: How much of a COMPLETED item's line survives. Measured on demo-project's board:
+#: the 19 done items are 15,756 chars — 48% of the whole backlog — averaging 829
+#: chars each, because a finished item accumulates its own completion write-up
+#: ("**Done** — see ADR-0031. `features/ghost/model` (pure): records ..."). The
+#: 17 items actually awaiting a plan total 2,704 chars. So half the most
+#: expensive block in the prompt is implementation archaeology about work that
+#: is finished, re-sent on every planner turn.
+#:
+#: What the planner needs from a done item is that it EXISTS, so it can reason
+#: about dependencies and not re-plan it. The detail is still in the file, and
+#: the planner has Read.
+DONE_TITLE_CHARS = 160
+
+#: Cross-references rescued out of a collapsed tail. Truncation otherwise drops
+#: exactly the pointers worth keeping — on this board 9 of 19 done items name an
+#: ADR past the cutoff — and a bare `ADR-0031` costs ~10 chars to preserve
+#: against ~700 saved. Deliberately generic (`ADR-0031`, `T-045`): a finished
+#: item that names another task id is a dependency hint, not just prose.
+REF_RE = re.compile(r"\b[A-Z]{2,}-\d+\b")
+
+
+def _collapse_done_items(ctx: RunContext, text: str) -> str:
+    """Abbreviate completed backlog items, keeping their ids and references.
+
+    Structure-preserving by construction: headings, blank lines, open items and
+    every line that is not a completed item pass through byte-identical, so the
+    planner still sees the board's real shape and ordering.
+    """
+    try:
+        backlog = make_backlog(ctx.cfg)
+        item_re, done_char = backlog.item_re, backlog.status_chars["done"]
+    except (AttributeError, KeyError, TypeError):
+        return text                    # unusual backlog config — leave it alone
+
+    out: list[str] = []
+    collapsed = 0
+    for line in text.splitlines():
+        m = item_re.match(line)
+        try:
+            is_done = bool(m) and m.group("status") == done_char
+            title = m.group("title") if m else ""
+        except (IndexError, re.error):    # pattern without the named groups
+            return text
+        if not is_done or len(title) <= DONE_TITLE_CHARS:
+            out.append(line)
+            continue
+        head = title[:DONE_TITLE_CHARS].rstrip()
+        tail = [r for r in dict.fromkeys(REF_RE.findall(title[DONE_TITLE_CHARS:]))
+                if r not in head]
+        refs = f"  [also refs: {', '.join(tail)}]" if tail else ""
+        out.append(line[:m.start("title")] + head + " …" + refs)
+        collapsed += 1
+    if collapsed:
+        out += ["", f"> ({collapsed} completed item(s) above are abbreviated — "
+                    f"their full write-ups are in "
+                    f"{ctx.cfg.project.backlog_file}, which you can Read if a "
+                    f"finished task's detail actually matters. Everything still "
+                    f"open is shown in full.)"]
+    return "\n".join(out)
+
+
 def _backlog_excerpt(ctx: RunContext, only_ids: list[str] | None) -> str:
     path = ctx.cfg.repo_path() / ctx.cfg.project.backlog_file
     text = path.read_text()
@@ -69,8 +130,98 @@ def _backlog_excerpt(ctx: RunContext, only_ids: list[str] | None) -> str:
                 keep.append(line)
             else:
                 current_match = False
+        # No collapse here: this path already dropped every item the caller did
+        # not ask for, so a done item is only present because it was requested.
         return "\n".join(keep)
-    return text
+    return _collapse_done_items(ctx, text)
+
+
+#: Character budget for the CURRENTLY PLANNED SPECS block. Measured on a real
+#: planner payload: 42 specs serialise to 80,677 chars, so this block is always
+#: the one that overflows.
+SPECS_BUDGET_CHARS = 20000
+
+#: Same, for the structural project map. Applied to a markdown document, so a cut
+#: here is merely lossy rather than malformed — but it is still announced.
+MAP_BUDGET_CHARS = 20000
+
+#: Fields kept when a spec is summarised rather than sent whole. The planner
+#: needs enough to avoid duplicating or colliding with an existing task; it does
+#: not need that task's acceptance criteria or worker notes.
+SLIM_SPEC_FIELDS = ("id", "title", "status", "milestone", "deps", "files_write",
+                    "parent_id", "agent_able")
+
+#: Titles are clamped in the SLIM form only. `title` is nominally a short
+#: imperative phrase, but nothing enforces that and the field drifts: on the
+#: demo-project board the longest is 4,146 characters of prose that belongs in
+#: `description`. Unclamped, three such entries can consume the whole block's
+#: budget and push every other id out of view — which is the one failure this
+#: block exists to prevent. A promoted spec still carries its title in full.
+SLIM_TITLE_CHARS = 120
+
+
+def _slim(spec: dict) -> dict:
+    row = {k: spec[k] for k in SLIM_SPEC_FIELDS if k in spec}
+    title = row.get("title")
+    if isinstance(title, str) and len(title) > SLIM_TITLE_CHARS:
+        row["title"] = title[:SLIM_TITLE_CHARS].rstrip() + "…"
+    return row
+
+
+def _specs_block(existing: list[dict], only_ids: list[str] | None,
+                 budget: int = SPECS_BUDGET_CHARS) -> str:
+    """Serialise the current queue to fit `budget` WITHOUT slicing the JSON.
+
+    The previous implementation was `json.dumps(existing)[:20000]`, which on a
+    real board cut the array mid-token: the planner was handed a malformed
+    fragment listing a quarter of the queue under a heading telling it not to
+    duplicate the rest. It paid ~5k tokens for something it could not parse.
+
+    The budget is spent deliberately instead, and the ORDER matters. Every spec
+    is listed in its slim form first, because the block's primary job is to stop
+    the planner reinventing or colliding with an id — and an id it cannot see is
+    an id it will reuse. Only the leftover budget buys full detail, promoting the
+    specs actually in play (the requested ids, plus anything still awaiting a
+    spec). Dropping entries entirely is the last resort, and it is announced:
+    a planner that knows 12 specs are hidden behaves very differently from one
+    handed a truncated array it believes is complete.
+    """
+    if not existing:
+        return "[]"                    # caller guards, but "all 0 omitted" is not a sentence
+    focus_ids = set(only_ids or ())
+
+    def is_focus(spec: dict) -> bool:
+        return (spec.get("id") in focus_ids
+                or spec.get("parent_id") in focus_ids
+                or spec.get("status") == "needs_plan")
+
+    def render(rows: list[dict], omitted: int) -> str:
+        text = json.dumps(rows, indent=1)
+        if omitted:
+            text += (f"\n\n({omitted} further spec(s) omitted to fit the prompt "
+                     f"— the queue holds {len(existing)} in total. Ask before "
+                     f"assuming an id is free.)")
+        return text
+
+    # Floor: everyone visible, nobody detailed.
+    entries = [_slim(spec) for spec in existing]
+    omitted = 0
+    while entries and len(render(entries, omitted)) > budget:
+        entries.pop()
+        omitted += 1
+    if not entries:
+        return (f"(all {len(existing)} specs omitted — they do not fit the "
+                f"prompt budget. Ask before assuming an id is free.)")
+
+    # Then spend what's left on detail, skipping (not stopping at) any single
+    # spec too large to fit — one oversized entry must not starve the rest.
+    for i, spec in enumerate(existing[:len(entries)]):
+        if not is_focus(spec):
+            continue
+        candidate = entries[:i] + [spec] + entries[i + 1:]
+        if len(render(candidate, omitted)) <= budget:
+            entries = candidate
+    return render(entries, omitted)
 
 
 def _full_prompt(ctx: RunContext, *, discussion: str, transcript: str,
@@ -83,8 +234,13 @@ def _full_prompt(ctx: RunContext, *, discussion: str, transcript: str,
     # current specs, so files_read authoring starts from a real skeleton.
     map_file = projectmap.map_path(ctx.cfg)
     if map_file.exists():
+        text = map_file.read_text()
+        if len(text) > MAP_BUDGET_CHARS:
+            text = (text[:MAP_BUDGET_CHARS].rsplit("\n", 1)[0]
+                    + f"\n\n(map truncated at {MAP_BUDGET_CHARS} chars — it is "
+                      f"not the complete tree; use Glob/Grep for anything below.)")
         parts += ["# PROJECT MAP (structure — verify against it before listing files)",
-                  map_file.read_text()[:20000], ""]
+                  text, ""]
     # The available asset ops, verbatim. The planner may set `asset_op: <name>`
     # on a spec, and this list is the only place those names exist — it cannot
     # invent one (persist_specs rejects unknown names) and it cannot guess one
@@ -100,7 +256,13 @@ def _full_prompt(ctx: RunContext, *, discussion: str, transcript: str,
         parts.append("")
     if existing:
         parts += ["# CURRENTLY PLANNED SPECS (update, don't duplicate)",
-                  json.dumps(existing, indent=1)[:20000], ""]
+                  _specs_block(existing, only_ids), ""]
+    # The digest of an expired session, if one is on file. Placed after the
+    # durable facts and before the live conversation, which is where it belongs
+    # chronologically — it IS the older conversation, compressed.
+    previous = handoff.prompt_block(ctx)
+    if previous:
+        parts += [previous, ""]
     if transcript:
         parts += ["# CONVERSATION SO FAR (most recent last)", transcript, ""]
     if discussion:
@@ -183,7 +345,12 @@ async def plan_or_ask(ctx: RunContext, *, discussion: str = "", transcript: str 
         input_tokens=result.input_tokens, output_tokens=result.output_tokens,
         cost_usd=result.cost_usd, cache_hit_tokens=result.cache_hit_tokens,
         cache_miss_tokens=result.cache_miss_tokens)
-    return parse_planner_output(result.text)
+    env = parse_planner_output(result.text)
+    # Write the handoff NOW, while the envelope is in hand and free. Deferring it
+    # to the moment a session is found expired would mean reconstructing it from
+    # a conversation that is, by then, expensive to read.
+    handoff.record(ctx, env)
+    return env
 
 
 def validate_spec(spec: dict, asset_ops: list[str] | None = None) -> None:
@@ -263,18 +430,33 @@ async def plan(ctx: RunContext, discussion: str = "",
     env = await plan_or_ask(ctx, discussion=discussion, only_ids=only_ids)
     if env["questions"]:
         raise PlannerNeedsInput(env["questions"], env["assumptions"])
-    return persist_specs(ctx, env["specs"], note=discussion)
+    specs = persist_specs(ctx, env["specs"], note=discussion)
+    # Same conclusion rule as `discuss`: the specs landed, so there is no
+    # interrupted conversation for a digest to bridge. Leaving it would inject
+    # this run's questions into the next, unrelated one.
+    handoff.clear(ctx)
+    return specs
 
 
 def needs_plan_ids(store, limit: int | None = None) -> list[str]:
     """Every task still awaiting a spec — the batch for `plan --all-needs-plan`.
 
     Planner cost scales with the number of `plan` INVOCATIONS, not with the number
-    of tasks planned: the static payload (prompt + project map + backlog + protocol)
-    is only ~17k tokens, and the other ~400k is one agentic Read/Grep/Glob pass over
-    the repo, amortised across everything in the call. Measured 385k for one task
-    and 425k for one item decomposed into two, so planning one at a time is the most
-    expensive way to use this harness.
+    of tasks planned. Measured on demo-project from the CLI's own session log
+    (5 API calls, one operator message, 2026-08-13):
+
+        first-call payload   47,368 tok   backlog + map + specs + system prompt
+        tool exploration     32,877 tok   9 tool calls
+        prefix re-reads     238,596 tok   the same payload, re-sent per step
+        ----------------------------------------------------------------------
+        total input         325,721 tok   (output: 12,273)
+
+    Two consequences. The payload dominates the genuinely-new tokens (47k vs 33k),
+    NOT the repo sweep — an earlier version of this comment claimed a "~17k payload
+    and a ~400k agentic pass", and both halves were wrong. And because every
+    agentic step re-sends the whole prefix, cost is roughly payload x steps: the
+    same work took 505k when it happened to need 7 steps instead of 5. So planning
+    one task at a time is the most expensive way to use this harness.
 
     `limit` exists because the opposite extreme is also wrong: specs written far
     ahead of the work go stale as earlier tasks land (a reviewer was observed

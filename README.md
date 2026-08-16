@@ -181,14 +181,35 @@ acceptance ahead of the volatile diffs, candidates in sorted order), so a
 providers, where the Anthropic-shaped `usage` splits input across fresh /
 cache-creation / cache-read buckets — and `status` prints both plus a hit rate.
 
-**Session reuse** (opt-in, `run.session_reuse`): a `discuss` loop otherwise
-re-sends backlog + project map + every current spec on every turn. With it on,
-the Claude CLI planner pins one session (`--session-id`) and continues it
-(`--resume`) for the rest of that loop, so later turns send only the human's new
-answer. Scoped per discuss run and closed at the end, so the planner never
-inherits an unrelated run's context; a failed resume falls back to the full
-payload automatically. Off by default — verify `--resume` against your installed
-CLI once, then enable.
+**Session reuse** (`run.session_reuse`, on by default): a `discuss` loop
+otherwise re-sends backlog + project map + every current spec on every turn.
+Measured on demo-project, that payload is 47k tokens, and because the agentic loop
+re-sends its prefix at every step one operator message billed 326k input tokens.
+With reuse on, the Claude CLI planner pins one session (`--session-id`) and
+continues it (`--resume`), so later turns send only the human's new answer.
+Scoped per discuss run and closed at the end, so the planner never inherits an
+unrelated run's context; a failed resume falls back to the full payload
+automatically.
+
+**Session expiry + handoff** (`providers.claude_cli.session_max_idle_s`, 50 min):
+resuming is cheap only while the conversation's prefix is still in Anthropic's
+prompt cache (1h TTL). Past it a resume replays the whole conversation at
+cache-write weight — worse than starting over. So a session idle longer than the
+window is abandoned, and what carries into the fresh one is a **digest** written
+at the end of each turn (assumptions, open questions, proposed spec ids) plus a
+full snapshot on disk that the planner reads *only if* the digest is
+insufficient. Costs ~200 tokens instead of replaying a dead conversation. See
+`orchestrator/ops/handoff.py`. The API's own idle TTL is derived from this window
+(`DEFAULT_SESSION_MAX_IDLE_S + 15 min`) so a chat is never reaped while it is
+still warm and resumable.
+
+**Payload budgets**: the planner prompt is assembled to fit, never sliced.
+Completed backlog items are collapsed to their id, a 160-char head, and any
+cross-references rescued from the dropped tail (on demo-project: 33k → 21k chars,
+with all 40 ids and every open item byte-identical). The current-specs block
+lists every spec in slim form first — an id the planner cannot see is an id it
+will reuse — then spends leftover budget promoting the in-play ones to full
+detail, so the block is always valid JSON.
 
 **Escalation ladder**: the cheap worker iterates on a warm cache up to
 `run.max_fix_rounds`; if it still can't land the task and

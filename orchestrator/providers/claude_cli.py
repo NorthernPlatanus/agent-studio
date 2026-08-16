@@ -24,6 +24,7 @@ import re
 import time
 import uuid
 from collections.abc import Callable
+from dataclasses import dataclass
 from pathlib import Path
 
 from ..core.errors import LimitExhausted, OrchestratorError, SessionLost
@@ -79,6 +80,21 @@ DEFAULT_RETRY_ATTEMPTS = 2
 #: through the API's fan-out for one planner turn.
 PROGRESS_MIN_INTERVAL_S = 2.0
 
+#: How long a pinned session may sit idle before `--resume` stops being a saving
+#: and becomes a penalty.
+#:
+#: Resuming is only cheap while the conversation's prefix is still in the prompt
+#: cache. Anthropic's cache TTL for these sessions is one hour; past it, a resume
+#: replays the ENTIRE accumulated conversation as fresh input, at cache-WRITE
+#: weight (1.25x) rather than cache-read weight (0.1x). Measured on a real
+#: planner turn: the prefix was 47k tokens and the whole invocation billed 326k
+#: input — a cold resume of that conversation costs more than starting over,
+#: because starting over at least re-sends only the 47k payload.
+#:
+#: 50 minutes leaves ten minutes of headroom under the one-hour TTL for a turn
+#: that is itself minutes long. 0 disables expiry (resume regardless of age).
+DEFAULT_SESSION_MAX_IDLE_S = 50 * 60
+
 #: What a RETRY sends when it resumes the killed attempt's session, in place of
 #: the original prompt. Verified against the CLI: a session that was SIGKILLed
 #: mid-turn still holds the prompt it was started with (a resumed session recalls
@@ -94,18 +110,63 @@ RESUME_NUDGE = (
 )
 
 
+@dataclass
+class _LiveSession:
+    """A pinned CLI conversation and when we last exchanged tokens with it.
+
+    `last_seen` is monotonic, not wall-clock: the whole point of the timestamp is
+    to reason about a cache TTL, and a laptop that sleeps or an NTP correction
+    must not make a cold session look warm (or vice versa).
+    """
+
+    sid: str
+    last_seen: float
+
+
 class ClaudeCliProvider(LLMProvider):
     type = "claude_cli"
 
     def __init__(self, name, pcfg, cfg):
         super().__init__(name, pcfg, cfg)
-        # continuity key -> CLI session uuid. Instance state, and provider
+        # continuity key -> live CLI session. Instance state, and provider
         # instances are cached per-Config (providers/__init__), so sessions are
         # scoped to one run and never leak across projects or tests.
-        self._sessions: dict[str, str] = {}
+        self._sessions: dict[str, _LiveSession] = {}
+
+    def session_max_idle_s(self) -> float:
+        """Idle ceiling for `--resume` (see DEFAULT_SESSION_MAX_IDLE_S)."""
+        try:
+            return float(self.pcfg.get("session_max_idle_s",
+                                       DEFAULT_SESSION_MAX_IDLE_S))
+        except (AttributeError, TypeError, ValueError):
+            return DEFAULT_SESSION_MAX_IDLE_S
+
+    def _live(self, key: str | None) -> _LiveSession | None:
+        """The session for `key`, or None — DROPPING it first if it has gone cold.
+
+        Expiry has to happen here rather than in `session_active` alone, because
+        `complete` is also reached without that check (the first turn of a loop
+        passes a session key with no delta). Both paths must agree, or the caller
+        abbreviates its payload for a session this method is about to discard.
+        """
+        if key is None:
+            return None
+        entry = self._sessions.get(key)
+        if entry is None:
+            return None
+        max_idle = self.session_max_idle_s()
+        idle = time.monotonic() - entry.last_seen
+        if max_idle > 0 and idle > max_idle:
+            self._sessions.pop(key, None)
+            log.info("planner session %s idle %.0fs (> %.0fs) — its prompt cache "
+                     "has expired, so resuming would replay the whole "
+                     "conversation at full price; starting fresh instead",
+                     key, idle, max_idle)
+            return None
+        return entry
 
     def session_active(self, key: str) -> bool:
-        return key in self._sessions
+        return self._live(key) is not None
 
     def end_session(self, key: str) -> None:
         self._sessions.pop(key, None)
@@ -138,12 +199,12 @@ class ClaudeCliProvider(LLMProvider):
         pinned: str | None = None
         resuming = False
         if session is not None:
-            pinned = self._sessions.get(session)
-            if pinned is None:
+            entry = self._live(session)         # expires a cold session for us
+            if entry is None:
                 pinned = str(uuid.uuid4())
-                self._sessions[session] = pinned
+                self._sessions[session] = _LiveSession(pinned, time.monotonic())
             else:
-                resuming = True
+                pinned, resuming = entry.sid, True
 
         idle_s = float(self.pcfg.get("idle_timeout_s", DEFAULT_IDLE_TIMEOUT_S))
         total_s = self.pcfg.get("timeout_s", DEFAULT_TOTAL_TIMEOUT_S)
@@ -177,7 +238,8 @@ class ClaudeCliProvider(LLMProvider):
                 use_resume = None
                 use_session_id = str(uuid.uuid4()) if session is not None else None
                 if session is not None:
-                    self._sessions[session] = use_session_id
+                    self._sessions[session] = _LiveSession(use_session_id,
+                                                           time.monotonic())
 
             # Resuming our own killed attempt: the session still holds the
             # original prompt (see RESUME_NUDGE), so send the nudge instead of a
@@ -259,6 +321,16 @@ class ClaudeCliProvider(LLMProvider):
                     await asyncio.sleep(_backoff(attempt))
                     continue
                 raise last_error
+
+            # The turn landed, so the conversation is warm again as of NOW. Only
+            # the clock moves: the id stays the one WE pinned (--session-id) or
+            # resumed (--resume). Adopting the stream's `session_id` here instead
+            # would be a guess about whether this CLI forks on resume, and that
+            # is precisely the kind of unverified assumption about external CLI
+            # surface this provider is written to avoid.
+            entry = self._sessions.get(session) if session is not None else None
+            if entry is not None:
+                entry.last_seen = time.monotonic()
 
             usage = payload.get("usage") or {}
             in_tok, hit, miss = cache_tokens(usage)
