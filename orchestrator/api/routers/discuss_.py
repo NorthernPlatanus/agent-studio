@@ -105,32 +105,118 @@ async def get_discuss(since: int = Query(0, ge=0, description="replay cursor: re
                 sup: JobSupervisor = Depends(get_supervisor)) -> DiscussState:
     session = manager.for_project(cfg.project_name)
     busy = sup.in_flight(cfg)
-    # The persisted transcript is the only thing that survives an API restart, so
-    # it is what the page shows when nothing is live. Reading it needs no store
-    # write — but `load_discussion` is a `Store` method, and `Store()` writes on
-    # construction, so it goes through the read-only connection instead.
+    persisted = _persisted(cfg)
+    # In-memory first, the store second. A session this process is driving is the
+    # live truth; the stored one is a snapshot of it that is at best equal and,
+    # mid-turn, a frame or two behind.
+    model = _session_model(session, since=since) if session else \
+        _restored_session(persisted["log"], since=since)
     return DiscussState(
         project=cfg.project_name,
-        session=_session_model(session, since=since) if session else None,
-        transcript=_persisted_transcript(cfg),
+        session=model,
+        # Suppressed once the frame log can speak for itself. The flattened
+        # `ROLE: text` blob is the planner's payload, not a conversation, and
+        # showing it *beside* the same conversation rendered properly is how the
+        # page ended up looking like a data dump with a chat missing.
+        transcript="" if model is not None else persisted["transcript"],
         options=_options(cfg),
         blocked_by_job=busy.command if busy is not None else None)
 
 
-def _persisted_transcript(cfg: Config) -> str:
+#: Statuses a restored session cannot honestly still claim. The asyncio task that
+#: drove the loop died with the process, so nothing is running and nothing is
+#: waiting for an answer that could ever be delivered.
+_LIVE_STATUSES = ("running", "awaiting")
+
+
+def _restored_session(log: dict | None, *, since: int) -> DiscussSessionModel | None:
+    """The last conversation, rebuilt from the store, read-only.
+
+    Sessions are process-local and always will be — `run_discuss` is an awaited
+    coroutine holding a provider subprocess. What is recoverable is what the
+    operator was *reading*, and that is worth recovering: restarting the API
+    used to blank the planner screen down to a start form and a folded blob of
+    `USER:` lines, which is not what the page is for.
+
+    A session caught mid-flight comes back `aborted`, with a frame saying why.
+    Reporting the stored `awaiting` instead would put the composer back on
+    screen with a question above it and no loop behind it — the operator types
+    an answer and the POST 404s on a session id that no longer exists.
+    """
+    if log is None:
+        return None
+    frames = [f for f in log.get("frames") or [] if isinstance(f, dict)]
+    if not frames:
+        return None
+
+    status = str(log.get("status") or "aborted")
+    interrupted = status in _LIVE_STATUSES
+    if interrupted:
+        status = "aborted"
+        # Appended rather than replacing the last frame: the conversation ended
+        # where it ended, and this is a note about the ending, not part of it.
+        # `note` because that is what it is — a loop-level remark, rendered in
+        # the transcript's quiet row rather than as a failure.
+        frames = [*frames, {
+            "seq": max(int(f.get("seq") or 0) for f in frames) + 1,
+            "ts": float(log.get("last_activity") or log.get("started_at") or 0.0),
+            "kind": "note",
+            "data": {"text": "The API restarted while this conversation was open, "
+                             "so the planner turn behind it is gone. Starting a new "
+                             "session sends this conversation along with it."},
+        }]
+
+    return DiscussSessionModel(
+        session_id=str(log.get("session_id") or "restored"),
+        project=str(log.get("project") or ""),
+        request=str(log.get("request") or ""),
+        status=status,
+        expects=None,
+        started_at=float(log.get("started_at") or 0.0),
+        last_activity_at=float(log.get("last_activity") or 0.0),
+        error=log.get("error") if isinstance(log.get("error"), str) else None,
+        applied=[s for s in log.get("applied") or [] if isinstance(s, dict)],
+        settings=_settings_model(DiscussSettings()),
+        # A pin belonged to a prompt loop that no longer exists, and listing
+        # attachments the next session will not inherit would be a lie.
+        pins=[],
+        frames=[DiscussFrame(seq=int(f.get("seq") or 0), ts=float(f.get("ts") or 0.0),
+                             kind=str(f.get("kind") or "note"),
+                             data=f.get("data") if isinstance(f.get("data"), dict) else {})
+               for f in frames if int(f.get("seq") or 0) > since])
+
+
+def _persisted(cfg: Config) -> dict:
+    """The stored conversation: the flattened transcript and the frame log.
+
+    Reading needs no store write — but `Store()` writes on construction, so this
+    goes through the read-only connection instead of instantiating one.
+    """
     from ..deps import open_read_only, store_path
+    blank: dict = {"transcript": "", "log": None}
     path = store_path(cfg)
     if path is None or not path.exists():
-        return ""
+        return blank
     conn = open_read_only(path)
     try:
-        row = conn.execute("SELECT transcript FROM discussions WHERE session=?",
+        row = conn.execute("SELECT * FROM discussions WHERE session=?",
                            (cfg.project_name,)).fetchone()
-        return row["transcript"] if row else ""
     except Exception:       # noqa: BLE001 — an old store may predate the table
-        return ""
+        return blank
     finally:
         conn.close()
+    if row is None:
+        return blank
+    keys = row.keys()
+    raw = row["frames"] if "frames" in keys else None     # a store older than the column
+    log = None
+    if raw:
+        try:
+            parsed = json.loads(raw)
+        except json.JSONDecodeError:
+            parsed = None
+        log = parsed if isinstance(parsed, dict) else None
+    return {"transcript": row["transcript"] if "transcript" in keys else "", "log": log}
 
 
 # ---- lifecycle -----------------------------------------------------------

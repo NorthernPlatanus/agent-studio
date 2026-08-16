@@ -404,3 +404,58 @@ async def test_the_operator_can_abort_a_freeze(tmp_path, monkeypatch):
                                           emit=frames.append)
     assert specs == [] and planner.calls == 1
     assert [f["kind"] for f in frames][-1] == "aborted"
+
+
+# ---- the persisted frame log ---------------------------------------------
+def test_the_frame_log_round_trips(tmp_path: Path):
+    store = Store(tmp_path / "s.sqlite3")
+    try:
+        assert store.load_discussion_log("proj") is None
+        store.save_discussion_log("proj", {"status": "awaiting", "frames": [
+            {"seq": 1, "ts": 1.0, "kind": "you", "data": {"text": "build it"}}]})
+        log = store.load_discussion_log("proj")
+        assert log["status"] == "awaiting"
+        assert log["frames"][0]["data"]["text"] == "build it"
+    finally:
+        store.close()
+
+
+def test_the_frame_log_and_the_transcript_do_not_clobber_each_other(tmp_path: Path):
+    """They have different owners: the transcript is what the planner is re-sent
+    on a resumed conversation, the frame log is what the operator reads. Both
+    live on one row and each writer must leave the other's column alone."""
+    store = Store(tmp_path / "s.sqlite3")
+    try:
+        store.save_discussion("proj", "USER: build it")
+        store.save_discussion_log("proj", {"frames": [{"seq": 1, "ts": 1.0,
+                                                       "kind": "you", "data": {}}]})
+        assert store.load_discussion("proj") == "USER: build it"
+        store.save_discussion("proj", "USER: build it\nPLANNER: {}")
+        assert store.load_discussion_log("proj")["frames"][0]["seq"] == 1
+    finally:
+        store.close()
+
+
+def test_a_store_written_before_the_frames_column_is_migrated(tmp_path: Path):
+    """Every existing state file predates this column. Opening one must add it
+    rather than fail, and must not lose the transcript already there."""
+    import sqlite3
+    path = tmp_path / "old.sqlite3"
+    conn = sqlite3.connect(path)
+    conn.execute("""CREATE TABLE discussions (session TEXT PRIMARY KEY,
+                                              transcript TEXT NOT NULL,
+                                              updated_at REAL NOT NULL)""")
+    conn.execute("INSERT INTO discussions VALUES('proj', 'USER: old', 1.0)")
+    conn.commit()
+    conn.close()
+
+    store = Store(path)
+    try:
+        assert store.load_discussion("proj") == "USER: old"
+        assert store.load_discussion_log("proj") is None
+        store.save_discussion_log("proj", {"frames": [{"seq": 1, "ts": 1.0,
+                                                       "kind": "you", "data": {}}]})
+        assert store.load_discussion_log("proj") is not None
+        assert store.load_discussion("proj") == "USER: old"
+    finally:
+        store.close()

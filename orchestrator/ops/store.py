@@ -60,6 +60,13 @@ CREATE TABLE IF NOT EXISTS events (
 CREATE TABLE IF NOT EXISTS discussions (
     session TEXT PRIMARY KEY,       -- usually the project name
     transcript TEXT NOT NULL,
+    frames TEXT,                    -- JSON frame log, for the panel (see save_discussion_log)
+    updated_at REAL NOT NULL
+);
+CREATE TABLE IF NOT EXISTS planner_handoff (
+    session TEXT PRIMARY KEY,       -- usually the project name
+    digest TEXT NOT NULL,           -- short TLDR inlined into a cold-start prompt
+    snapshot_path TEXT,             -- full proposal on disk, read only on demand
     updated_at REAL NOT NULL
 );
 """
@@ -92,6 +99,11 @@ class Store:
             if col not in cols:
                 self._conn.execute(
                     f"ALTER TABLE usage ADD COLUMN {col} INTEGER NOT NULL DEFAULT 0")
+        cols = {r["name"] for r in self._conn.execute("PRAGMA table_info(discussions)")}
+        if "frames" not in cols:
+            # Nullable with no default: an old row has no frame log, and "" would
+            # be indistinguishable from a conversation that genuinely had none.
+            self._conn.execute("ALTER TABLE discussions ADD COLUMN frames TEXT")
 
     # ---- tasks ----------------------------------------------------------
     def upsert_task(self, spec: dict[str, Any]) -> None:
@@ -353,6 +365,67 @@ class Store:
         row = self._conn.execute(
             "SELECT transcript FROM discussions WHERE session=?", (session,)).fetchone()
         return row["transcript"] if row else ""
+
+    def save_discussion_log(self, session: str, log: dict[str, Any]) -> None:
+        """Persist the panel's frame log for a session.
+
+        Separate from `save_discussion` because the two have different owners and
+        different shapes. The transcript is what the *planner* is re-sent on a
+        resumed conversation — `ROLE: text`, flattened, lossy on purpose. This is
+        what the *operator* reads: the typed frames, with their kinds, sequence
+        and timestamps intact.
+
+        Without it the panel had nothing to show after an API restart but that
+        flattened blob, so a conversation came back as a wall of `USER:` /
+        `PLANNER:` lines in a folded `<pre>` — the chat replaced by a dump of
+        itself. Sessions live in process memory (`api.discuss.DiscussManager`)
+        and always will; this is what makes losing them survivable.
+
+        Writes the whole log each time rather than appending: it is tens of
+        frames, it is rewritten only on a real frame (never on `progress`), and
+        one row that is always complete cannot half-restore.
+        """
+        self._conn.execute(
+            """INSERT INTO discussions(session, transcript, frames, updated_at)
+               VALUES(?,'',?,?)
+               ON CONFLICT(session) DO UPDATE SET
+                 frames=excluded.frames, updated_at=excluded.updated_at""",
+            (session, json.dumps(log), time.time()))
+        self._conn.commit()
+
+    def load_discussion_log(self, session: str) -> dict[str, Any] | None:
+        """The persisted frame log, or None if this store predates it."""
+        try:
+            row = self._conn.execute(
+                "SELECT frames FROM discussions WHERE session=?", (session,)).fetchone()
+        except sqlite3.OperationalError:        # a store older than the column
+            return None
+        if row is None or not row["frames"]:
+            return None
+        try:
+            log = json.loads(row["frames"])
+        except json.JSONDecodeError:
+            return None
+        return log if isinstance(log, dict) else None
+
+    # ---- planner handoff (TLDR carried across an expired session) ---------
+    def save_handoff(self, session: str, digest: str,
+                     snapshot_path: str | None = None) -> None:
+        self._conn.execute(
+            """INSERT INTO planner_handoff(session, digest, snapshot_path, updated_at)
+               VALUES(?,?,?,?)
+               ON CONFLICT(session) DO UPDATE SET
+                 digest=excluded.digest,
+                 snapshot_path=excluded.snapshot_path,
+                 updated_at=excluded.updated_at""",
+            (session, digest, snapshot_path, time.time()))
+        self._conn.commit()
+
+    def load_handoff(self, session: str) -> dict | None:
+        row = self._conn.execute(
+            """SELECT digest, snapshot_path, updated_at
+               FROM planner_handoff WHERE session=?""", (session,)).fetchone()
+        return dict(row) if row else None
 
     # ---- events ----------------------------------------------------------
     def log_event(self, run_id: str | None, task_id: str | None,

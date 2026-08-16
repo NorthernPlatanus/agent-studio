@@ -27,7 +27,7 @@ import logging
 import re
 import time
 import uuid
-from collections.abc import AsyncIterator
+from collections.abc import AsyncIterator, Callable
 from dataclasses import dataclass, field
 from pathlib import PurePosixPath
 
@@ -37,12 +37,29 @@ from ..core.config import Config
 from ..engine import runner
 from ..nodes.discuss import DiscussSettings, PinnedFile, run_discuss
 from ..ops.store import Store
+from ..providers.claude_cli import DEFAULT_SESSION_MAX_IDLE_S
 
 log = logging.getLogger("orchestrator.api.discuss")
 
-#: A session with no reply for this long is closed — a browser tab that goes away
-#: mid-question would otherwise hold the project's write lock forever.
-IDLE_TTL_S = 30 * 60
+#: How long the operator may leave a session unanswered before it is closed — a
+#: browser tab that goes away mid-question would otherwise hold the project's
+#: write lock forever.
+#:
+#: This is NOT a prompt-cache clock; the cache is entirely the provider window's
+#: business (claude_cli.session_max_idle_s, 50 min under the 1h TTL). The single
+#: coupling is that this one must not fire INSIDE that window, or the warm
+#: window is unreachable: an operator returning at 40 minutes would find the
+#: session already reaped and start cold, re-sending the whole payload, even
+#: though the conversation was still warm and resumable.
+#:
+#: Hence "the provider window, plus slack" rather than a number of its own. The
+#: slack is not decoration: the two clocks start at different moments — this one
+#: when the operator posts, the provider's when the turn it triggered FINISHES —
+#: so on a three-minute planner turn this clock already runs three minutes ahead
+#: and would reap first if the two were equal.
+#:
+#: If you raise session_max_idle_s, raise this with it (it is read at import).
+IDLE_TTL_S = DEFAULT_SESSION_MAX_IDLE_S + 15 * 60
 
 #: Per pinned file. The planner can still `Read` the whole thing; the pin is a
 #: prompt-cost decision, and an unbounded one would blow the context on a lockfile.
@@ -95,6 +112,9 @@ class Session:
     _subscribers: list[asyncio.Queue] = field(default_factory=list, repr=False)
     _task: asyncio.Task | None = field(default=None, repr=False)
     _aborting: bool = False
+    #: Where to write the frame log so it outlives this process. Set by
+    #: `DiscussManager.start`; `None` in tests that drive a bare `Session`.
+    _persist: Callable[[dict], None] | None = field(default=None, repr=False)
 
     # -- frames -----------------------------------------------------------
     def push(self, event: dict) -> Frame:
@@ -135,7 +155,59 @@ class Session:
             self.status, self.expects = "running", None
         for queue in list(self._subscribers):
             queue.put_nowait(frame)
+        # Written on every frame the log keeps, which is every kind but
+        # `progress` — tens per session, not thousands. Deliberately after the
+        # fan-out: the live subscriber must never wait on sqlite, and a failed
+        # write must not cost the operator the frame on screen.
+        if kind != "progress":
+            self.save()
         return frame
+
+    def save(self) -> None:
+        """Write the frame log through, if this session has somewhere to write.
+
+        Never raises. A store that cannot be written is a real problem, but it is
+        not one worth ending a planning conversation over — the session in memory
+        is still correct and still on screen, and what is lost is only its
+        recoverability after a restart.
+        """
+        if self._persist is None:
+            return
+        try:
+            self._persist(self.log_payload())
+        except Exception:               # noqa: BLE001 — logged, never propagated
+            log.warning("could not persist discuss session %s", self.session_id,
+                        exc_info=True)
+
+    def log_payload(self) -> dict:
+        """The session as the store holds it: enough to render it read-only.
+
+        Not enough to *resume* it, and that is the point — the asyncio task that
+        drives the loop cannot outlive the process, so a restored session is a
+        transcript with a status, never something the operator can reply into.
+        Pins and settings are left out for the same reason: a pin is prompt state
+        belonging to a loop that no longer exists.
+        """
+        return {
+            "session_id": self.session_id,
+            "project": self.project,
+            "request": self.request,
+            "started_at": self.started_at,
+            "last_activity": self.last_activity,
+            # What it was doing when this was written. A live value here means the
+            # process went away mid-conversation — see `_restored_session`.
+            "status": self.status,
+            "expects": self.expects,
+            "error": self.error,
+            "applied": self.applied,
+            # `progress` is dropped rather than carried. The live log already
+            # keeps only the newest one so a mid-turn reconnect can show current
+            # activity — but there is no such thing as current activity in a
+            # session read back from disk, and "Read src/foo.ts" as the closing
+            # line of a restored conversation is worse than nothing.
+            "frames": [{"seq": f.seq, "ts": f.ts, "kind": f.kind, "data": f.data}
+                       for f in self.frames if f.kind != "progress"],
+        }
 
     def since(self, cursor: int) -> list[Frame]:
         return [f for f in self.frames if f.seq > cursor]
@@ -271,6 +343,12 @@ class DiscussManager:
 
         store = store_factory(cfg.store_path())
         run_id = store.create_run(note="discuss")
+        # One row per project, overwritten as this session runs — so opening a
+        # new conversation replaces the old one in the store exactly as it does
+        # on screen, and nothing accumulates.
+        if hasattr(store, "save_discussion_log"):
+            session._persist = lambda payload: store.save_discussion_log(
+                cfg.project_name, payload)
         ctx = runner.make_context(cfg, store, run_id)
         session._task = asyncio.create_task(
             self._drive(session, ctx, store, run_id, request),

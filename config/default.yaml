@@ -50,6 +50,16 @@ providers:
     # Absolute ceiling — the backstop against a loop that emits forever. Loose on
     # purpose; the idle clock is the one meant to fire. null disables it.
     timeout_s: 3600
+    # ── How long a reused session stays worth resuming ───────────────────────
+    # `--resume` is cheap only while the conversation's prefix is still in the
+    # prompt cache (TTL: one hour). Past it, resuming replays the WHOLE
+    # accumulated conversation as fresh input at cache-write weight — strictly
+    # worse than starting over, which at least re-sends only the payload. So a
+    # session idle longer than this is abandoned and the next turn opens a new
+    # one, carrying a digest of the old (see ops/handoff.py) instead of its
+    # tokens. 50 minutes leaves headroom under the TTL for a turn that is itself
+    # minutes long. 0 disables expiry.
+    session_max_idle_s: 3000
     # Attempts per call, total (1 = no retry). Spent only on failures that say
     # nothing about the request: an idle wedge, or a transient 5xx/network exit.
     # A limit hit is never retried (it becomes LimitExhausted for the run's own
@@ -186,10 +196,16 @@ run:
   # every current spec on every turn. Scoped per discuss run and closed when the
   # loop ends, so the planner never inherits an unrelated run's context. A failed
   # resume falls back to the full payload automatically (SessionLost).
-  # OFF by default: verify it against your installed CLI once, then enable —
-  # `claude -p --resume` behavior is the one thing here we cannot unit-test.
+  # ON: measured, the payload it stops re-sending is ~47k tokens, and because the
+  # agentic loop re-sends its prefix on every step that turned into 326k input
+  # tokens for a single operator message. A resumed turn sends the human's answer
+  # and nothing else.
+  # A session that has gone cold is NOT resumed (providers.claude_cli
+  # .session_max_idle_s) and a failed resume falls back to the full payload
+  # automatically (SessionLost) — both paths are self-healing, which is what
+  # makes this safe to default on.
   # Providers without server-side sessions (codex_cli, openai_compatible) ignore it.
-  session_reuse: false
+  session_reuse: true
   # How long the PLANNER CHAT may sit frozen waiting for an exhausted usage
   # window to reset, before it gives up and hands the decision back.
   #

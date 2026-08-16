@@ -575,3 +575,133 @@ def test_the_freeze_clears_when_the_turn_resumes():
     assert session.frozen_until is not None
     session.push({"kind": "thinking"})                  # the retry started
     assert session.frozen_until is None
+
+
+# ---- surviving a restart -------------------------------------------------
+#
+# Sessions are process-local and always will be: `run_discuss` is an awaited
+# coroutine holding a provider subprocess. What the panel loses when the API
+# restarts is not the loop — that is genuinely gone — but the *conversation*,
+# and that is only lost because it was never written down. These cover writing
+# it down and reading it back.
+
+
+def _restart(manager: DiscussManager) -> None:
+    """A fresh process, as far as the manager is concerned: no sessions in
+    memory, the store untouched."""
+    manager._sessions.clear()
+
+
+def test_the_conversation_comes_back_after_a_restart(client: TestClient, manager):
+    session_id = _start(client)["session_id"]
+    asked = _await_status(client, session_id, "awaiting")
+    original = [(f["kind"], f["data"].get("text") or f["data"].get("q"))
+                for f in asked["frames"] if f["kind"] in ("you", "question")]
+
+    _restart(manager)
+    session = client.get(BASE).json()["session"]
+    assert session is not None, "the planner page went blank on a restart"
+    assert session["session_id"] == session_id
+    restored = [(f["kind"], f["data"].get("text") or f["data"].get("q"))
+                for f in session["frames"] if f["kind"] in ("you", "question")]
+    assert restored == original
+    assert original, "nothing was persisted to come back"
+
+
+def test_a_restored_session_is_read_only(client: TestClient, manager):
+    """It comes back `aborted`, not `awaiting`. Reporting the status it was
+    caught at would put a composer under a question with no loop behind it, and
+    the answer would 404 on a session id that no longer exists."""
+    session_id = _start(client)["session_id"]
+    _await_status(client, session_id, "awaiting")
+
+    _restart(manager)
+    session = client.get(BASE).json()["session"]
+    assert session["status"] == "aborted"
+    assert session["expects"] is None
+    # And the transcript says why, rather than the conversation just stopping.
+    notes = [f["data"]["text"] for f in session["frames"] if f["kind"] == "note"]
+    assert any("restarted" in note for note in notes)
+    assert client.post(f"{BASE}/{session_id}/reply",
+                       json={"text": "the default one"}).status_code == 404
+
+
+def test_a_finished_session_keeps_its_own_status_across_a_restart(client, manager):
+    session_id = _start(client)["session_id"]
+    _await_status(client, session_id, "awaiting")
+    client.post(f"{BASE}/{session_id}/reply", json={"text": "the default one"})
+    _await_status(client, session_id, "awaiting")
+    client.post(f"{BASE}/{session_id}/reply", json={"text": "y"})
+    _await_status(client, session_id, "done")
+
+    _restart(manager)
+    session = client.get(BASE).json()["session"]
+    assert session["status"] == "done"
+    assert [s["id"] for s in session["applied"]] == ["T-900"]
+    # Nothing was interrupted, so nothing claims it was.
+    assert not any("restarted" in f["data"].get("text", "")
+                   for f in session["frames"] if f["kind"] == "note")
+
+
+def test_the_flat_transcript_is_suppressed_once_the_frames_can_speak(client, manager):
+    """`transcript` is the planner's payload — `ROLE: text`, flattened. Rendered
+    beside the same conversation as frames it is a dump of what is already on
+    screen, which is what the page had become."""
+    session_id = _start(client)["session_id"]
+    _await_status(client, session_id, "awaiting")
+    _restart(manager)
+    assert client.get(BASE).json()["transcript"] == ""
+
+
+def test_a_store_written_before_frame_logs_still_shows_its_transcript(client, cfg):
+    """The seeded store has a transcript and no frame log. That is every store
+    that existed before this, and it must not come back empty."""
+    state = client.get(BASE).json()
+    assert state["session"] is None
+    assert "rebuild the run timeline" in state["transcript"]
+
+
+def test_a_live_session_outranks_the_stored_copy(client: TestClient):
+    """Mid-turn the store is a frame or two behind. The session this process is
+    driving is the truth."""
+    session_id = _start(client)["session_id"]
+    _await_status(client, session_id, "awaiting")
+    session = client.get(BASE).json()["session"]
+    assert session["status"] == "awaiting"      # not the terminal restored shape
+    assert session["expects"] == "answer"
+
+
+def test_progress_frames_are_never_written_to_the_store():
+    """Hundreds arrive per turn and each would be an sqlite commit. The write is
+    skipped for them, and the newest one the live log retains — so a mid-turn
+    reconnect can show current activity — is left out of the payload too, since
+    a restored conversation has no current activity to show."""
+    session = discuss_mod.Session(session_id="s4", project=PROJECT, request="r",
+                                  started_at=time.time())
+    writes: list[dict] = []
+    session._persist = writes.append
+
+    session.push({"kind": "you", "text": "go"})
+    assert len(writes) == 1
+    for i in range(30):
+        session.push({"kind": "progress", "phase": "tool", "tool": "Read",
+                      "target": f"f{i}.ts"})
+    assert len(writes) == 1, "a progress frame committed to sqlite"
+
+    session.push({"kind": "note", "text": "a real frame"})
+    assert len(writes) == 2
+    assert [f["kind"] for f in writes[-1]["frames"]] == ["you", "note"]
+    # The live log still holds the newest, for a reconnect mid-turn.
+    assert [f.kind for f in session.frames] == ["you", "progress", "note"]
+
+
+def test_a_store_that_cannot_be_written_does_not_end_the_conversation():
+    """Losing recoverability is bad. Losing the conversation the operator is
+    having, because sqlite was locked, is worse."""
+    session = discuss_mod.Session(session_id="s3", project=PROJECT, request="r",
+                                  started_at=time.time())
+    def explode(_payload):
+        raise RuntimeError("database is locked")
+    session._persist = explode
+    session.push({"kind": "you", "text": "still here"})
+    assert [f.kind for f in session.frames] == ["you"]
