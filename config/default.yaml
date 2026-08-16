@@ -35,7 +35,7 @@ providers:
     allowed_tools: "Read,Grep,Glob"   # read-only: planner/reviewer inspect, never edit
     # ── Timeouts: the IDLE clock is the real one ──────────────────────────────
     # A smart-tier call is a tool loop whose length the model decides. Measured
-    # on the planner (demo-project, opus at effort=high): a healthy turn is 24 tool
+    # on a pre-alpha test run (opus at effort=high): a healthy turn is 24 tool
     # turns / ~1.1M tokens read / 334s, and the same call has been observed past
     # 600s. So a wall-clock cap sized for the median fails intermittently no
     # matter what number you pick — which is exactly what the old `timeout_s: 600`

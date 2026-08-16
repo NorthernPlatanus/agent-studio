@@ -22,7 +22,9 @@ Two things are deliberate:
   `verify_unverifiable`, `crashed`.
 
 It writes a real store through `ops.store.Store`, so if the schema changes the
-fixture follows it automatically. Never point it at `state/demo-project.*`.
+fixture follows it automatically. Never point it at a live project's state dir:
+it refuses to write into a directory that already holds a store, but treat that
+as a backstop, not as permission to aim it carelessly.
 """
 
 from __future__ import annotations
@@ -283,16 +285,20 @@ def seed_checkpoint(checkpoint_path: Path) -> None:
 
 def main(argv: list[str] | None = None) -> int:
     args = list(sys.argv[1:] if argv is None else argv)
-    if len(args) != 1:
-        print("usage: python -m tests.api.fixtures.seed_store <state_dir>",
+    force = "--force" in args
+    positional = [a for a in args if a != "--force"]
+    if len(positional) != 1:
+        print("usage: python -m tests.api.fixtures.seed_store <state_dir> [--force]",
               file=sys.stderr)
         return 2
-    state_dir = Path(args[0]).expanduser().resolve()
-    if "demo-project" in str(state_dir) or (state_dir / "demo-project.sqlite3").exists():
-        # The live project is never a fixture target; refuse rather than trust the
-        # caller to have read the runbook.
-        print(f"refusing to seed into {state_dir}: it holds the live project's state",
-              file=sys.stderr)
+    state_dir = Path(positional[0]).expanduser().resolve()
+    # A directory that already holds a store is somebody's real state, and this
+    # writes fabricated runs. Refuse by shape rather than by name — a hardcoded
+    # project name only protects the one project whoever wrote it had in mind.
+    existing = sorted(p.name for p in state_dir.glob("*.sqlite3"))
+    if existing and not force:
+        print(f"refusing to seed into {state_dir}: it already holds "
+              f"{', '.join(existing)} (pass --force to overwrite)", file=sys.stderr)
         return 2
     path = state_dir / f"{PROJECT}.sqlite3"
     seed(path)

@@ -4,7 +4,7 @@
 
 That is what both CLI providers used to do, and it puts a WALL-CLOCK cap on a
 call whose length is decided by how many tool round-trips the model chooses to
-make. Measured on the real planner (demo-project, opus at effort=high): a healthy
+make. Measured on a pre-alpha test run (opus at effort=high): a healthy
 turn is 24 tool turns / ~1.1M tokens read / 334s, and the same call has been
 observed to run past 600s. A wall-clock cap sized for the median therefore fails
 intermittently forever, and there is no number that fixes it — the distribution,
