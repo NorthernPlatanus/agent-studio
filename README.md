@@ -9,6 +9,13 @@ lives in the **gitignored** `projects/<name>/profile.yaml` (with optional
 prompt overrides in `projects/<name>/prompts/`). The loader reads the new path
 first and falls back to the legacy `config/projects/<name>.yaml`.
 
+<img src=".github/assets/task-graph.jpg" width="720"
+     alt="The compiled LangGraph task graph. __start__ enters dispatch, which fans out to work_candidate; candidates land in collect, which routes to review, visual_gate, integrate, finalize or back to dispatch. review routes to integrate, verify, finalize or dispatch; verify and visual_gate route back the same way. integrate leads to finalize, and finalize to __end__.">
+
+<sup>The task graph, as LangGraph Studio renders it from `orchestrator/engine/graph.py`. Solid
+edges are unconditional; every dashed one is a router. Each arrow back into `dispatch` is a
+retry, an escalation, or a reviewer's `revise`.</sup>
+
 ## The economic model
 
 Two tiers of intelligence, priced accordingly:
@@ -149,6 +156,23 @@ your local server. The Studio UI needs a free LangSmith login; set
 machine. Without `ORCH_PROJECT` the graph is view-only topology; with a
 project profile you can invoke a single task straight from the UI against
 the real store/repo.
+
+## Control panel
+
+`serve` exposes the read layer and job control over HTTP:
+
+```bash
+pip install -e ".[dev,api]"
+python -m orchestrator serve --project example   # 127.0.0.1:8787, schema at /openapi.json
+```
+
+[agent-studio-ui](https://github.com/NorthernPlatanus/agent-studio-ui) is a React
+panel on top of that API — planner conversation, task pipeline, live jobs over
+SSE, usage ledger. Separate repo, and optional: `[api]` is an extra, and the
+orchestrator plans and runs headless without it.
+
+The API has **no authentication** and binds to loopback deliberately. Do not move
+it off `127.0.0.1` without putting something in front of it.
 
 ## Key behaviors
 
@@ -393,3 +417,7 @@ projects/ state/          (gitignored) per-project overlays; SQLite store + chec
   extend when the CLI's wording changes.
 - SQLite checkpointing is fine for this scale (a handful of parallel tasks);
   it is not a multi-machine setup.
+
+## License
+
+MIT — see [LICENSE](LICENSE).
