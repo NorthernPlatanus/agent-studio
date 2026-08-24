@@ -41,8 +41,11 @@ class RecordingProvider:
         return LLMResult(text=self.text)
 
     async def complete_chat(self, *, model, system, messages, cwd=None,
-                            params=None, session=None, effort=None):
-        self.calls.append({"params": params, "effort": effort,
+                            params=None, session=None, effort=None,
+                            allowed_tools=None, mcp_config=None,
+                            on_progress=None):
+        # Signature parity with LLMProvider.complete_chat — see test_worker_loop.
+        self.calls.append({"params": params, "effort": effort, "session": session,
                            "messages": [dict(m) for m in messages]})
         return LLMResult(text=self.text)
 

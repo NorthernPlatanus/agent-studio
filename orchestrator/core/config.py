@@ -5,7 +5,12 @@ Merge order (later wins):
   2. projects/<name>/profile.yaml      — the project profile (--project / ORCH_PROJECT),
      falling back to the legacy config/projects/<name>.yaml when the new path is absent
   3. config/local.yaml                 — personal overrides (gitignored)
-  4. ORCH_<SECTION>_<KEY> env vars     — e.g. ORCH_PROJECT_REPO_PATH, ORCH_RUN_N_CANDIDATES,
+  4. state/<name>.assignments.json     — the Studio assignment overlay: preset and
+     effort bindings written by the control panel (core/assignments.py). Placed
+     here, above the profile and below the environment, so a panel binding beats
+     the file a human hand-edited last week while ORCH_* stays the emergency
+     override it has always been.
+  5. ORCH_<SECTION>_<KEY> env vars     — e.g. ORCH_PROJECT_REPO_PATH, ORCH_RUN_N_CANDIDATES,
      ORCH_VISUAL_GATE_ENABLED. The section may itself contain underscores; it is
      resolved against the loaded config's real top-level keys (longest match
      wins). Scalars only, and exactly one level deep — providers.claude_cli.* and
@@ -26,6 +31,8 @@ from pathlib import Path
 from typing import Any
 
 import yaml
+
+from .assignments import apply_overlay, overlay_path, read_overlay
 
 CONFIG_DIR = Path(__file__).resolve().parents[2] / "config"
 
@@ -189,6 +196,23 @@ class Config(Section):
         return self.state_dir() / f"{self.project_name}.checkpoints.sqlite3"
 
 
+def _assignments_path(data: dict, project: str, root: Path) -> Path:
+    """Where this project's assignment overlay lives, mid-merge.
+
+    `ORCH_PATHS_STATE_DIR` is read HERE rather than left to `_apply_env` below,
+    which is the one place the documented layer order has to be bent: the
+    overlay is a file whose *location* the environment can move, so the path has
+    to be resolved before the environment layer is applied to the rest of the
+    config. Nothing about the overlay's *contents* is decided early — the env
+    layer still runs afterwards and still wins over everything it merges.
+    """
+    raw = os.environ.get("ORCH_PATHS_STATE_DIR") \
+        or (data.get("paths") or {}).get("state_dir") or "state"
+    directory = Path(str(raw)).expanduser()
+    return overlay_path(directory if directory.is_absolute() else root / directory,
+                        project)
+
+
 def load_config(project: str | None = None, root: Path | None = None) -> Config:
     root = (root or CONFIG_DIR.parent).resolve()
     cfg_dir = root / "config"
@@ -215,7 +239,18 @@ def load_config(project: str | None = None, root: Path | None = None) -> Config:
     # `gate.install_cmd` there otherwise makes worker tests shell out to a real
     # `npm ci`, so the suite passes or fails depending on whose laptop it is.
     # Not a knob for normal runs; nothing but the tests should set it.
+    #
+    # The assignment overlay is gated by the same flag, and for the same reason:
+    # it lives in `paths.state_dir`, which for the repo default is this checkout's
+    # own `state/` — the directory holding the operator's real project stores. A
+    # unit test that read it would pass or fail depending on what the operator
+    # last clicked in the control panel, which is precisely the class of bug this
+    # flag exists to prevent. Tests that want the overlay merge build their own
+    # root and clear the flag for the duration.
     if not os.environ.get("ORCH_SKIP_LOCAL_CONFIG"):
         data = _deep_merge(data, _load_yaml(cfg_dir / "local.yaml"))
+        if project:
+            path = _assignments_path(data, project, root)
+            data = apply_overlay(data, read_overlay(path), source=str(path))
     data = _apply_env(data)
     return Config(data, project or "default", root)

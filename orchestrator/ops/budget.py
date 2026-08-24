@@ -18,6 +18,7 @@ from __future__ import annotations
 import logging
 
 from ..core.errors import BudgetExceeded
+from .pricing import build_price_table, price
 from .store import Store
 
 log = logging.getLogger("orchestrator.budget")
@@ -47,16 +48,15 @@ class Budget:
         for name in (cfg.get("providers") or {}).keys():
             entry = cfg.providers.get(name)
             self._providers[name] = entry.as_dict() if entry is not None else {}
-        # model id -> ($/Mtok in, $/Mtok out), for the pre-flight estimate only;
-        # recorded cost still comes from the provider.
-        self._prices: dict[str, tuple[float, float]] = {}
-        for wm in (cfg.get("worker_models") or {}).keys():
-            entry = cfg.worker_models.get(wm)
-            if entry is None:
-                continue
-            self._prices[entry.get("model")] = (
-                float(entry.get("input_per_mtok", 0) or 0),
-                float(entry.get("output_per_mtok", 0) or 0))
+        # provider name -> {model id -> pricing entry}, for the pre-flight
+        # estimate only; recorded cost still comes from the provider itself.
+        # Snapshotted per provider (not one flat model->price map) because two
+        # providers can serve the same model id at different rates, and the
+        # estimate knows which one it is about to call. Built by ops.pricing —
+        # the SAME table the providers price with, so the guard and the ledger
+        # can no longer disagree about what a call costs.
+        self._prices: dict[str, dict[str, dict]] = {
+            name: build_price_table(cfg, name) for name in self._providers}
 
     def _is_cash(self, provider: str, provider_type: str) -> bool:
         pcfg = self._providers.get(provider, {})
@@ -102,12 +102,15 @@ class Budget:
         """
         if not self._is_cash(provider, provider_type):
             return 0.0
-        price_in, price_out = self._prices.get(model, (0.0, 0.0))
-        if not price_in and not price_out:
+        entry = self._prices.get(provider, {}).get(model)
+        if not entry:
             return 0.0            # no price table entry: nothing to estimate from
         in_tok = prompt_chars / self._CHARS_PER_TOKEN
         out_tok = max_output_tokens or self.assumed_max_output
-        estimate = in_tok / 1e6 * price_in + out_tok / 1e6 * price_out
+        # No cache split is passed: the estimate must assume a COLD prompt.
+        # Guessing a hit rate here would quietly halve the estimate on the exact
+        # calls (long, warm-prefix worker turns) this guard exists to stop.
+        estimate = price(entry, in_tok, out_tok)
 
         run_spend = self.store.run_cash_spend(self.run_id)
         if run_spend + estimate > self.per_run:

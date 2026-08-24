@@ -14,6 +14,7 @@ from ..ops.backlog import make_backlog, parent_id
 from ..ops import projectmap
 from ..core.context import RunContext
 from ..core.state import TaskState, latest_candidates
+from ..providers import get_provider
 
 log = logging.getLogger("orchestrator.integrator")
 
@@ -111,6 +112,29 @@ async def integrate(ctx: RunContext, state: TaskState) -> dict:
             "outcome": "done"}
 
 
+def _end_worker_session(ctx: RunContext, task_id: str, cand_id: str) -> None:
+    """Forget the provider-side conversation this candidate was holding.
+
+    Only matters on a session-capable backend (claude_cli); everywhere else
+    `end_session` is the base class's no-op. It matters there because a provider
+    instance is cached for the lifetime of the Config — i.e. the whole run — so
+    without this every candidate of every finished task keeps a pinned CLI
+    session id alive until `session_max_idle_s` eventually expires it. The
+    session is also rooted at a worktree this function's caller is about to
+    delete, so there is nothing left for it to continue.
+
+    Never raises. This is cleanup on the terminal path: a task that already
+    succeeded (or already failed) must not be re-reported as a failure because
+    a bookkeeping call did not like an unusual candidate id.
+    """
+    try:
+        provider_name, _ = ctx.worker_target(cand_id)
+        get_provider(ctx.cfg, provider_name).end_session(
+            ctx.worker_session_key(task_id, cand_id))
+    except Exception as e:
+        log.debug("could not end the %s session for %s: %s", cand_id, task_id, e)
+
+
 async def finalize(ctx: RunContext, state: TaskState) -> dict:
     task_id = state["task_id"]
     outcome = state.get("outcome")
@@ -153,6 +177,7 @@ async def finalize(ctx: RunContext, state: TaskState) -> dict:
 
     # Worktree/branch cleanup for every candidate of this task.
     for cand in latest_candidates(state).values():
+        _end_worker_session(ctx, task_id, cand["cand_id"])
         wt_name = f"{task_id}-{cand['cand_id']}".lower()
         try:
             await ctx.git.aremove_worktree(wt_name)

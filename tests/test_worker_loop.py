@@ -97,7 +97,14 @@ class ScriptedProvider:
         return LLMResult(text=text)
 
     async def complete_chat(self, *, model, system, messages, cwd=None,
-                            params=None, session=None, effort=None):
+                            params=None, session=None, effort=None,
+                            allowed_tools=None, mcp_config=None,
+                            on_progress=None):
+        # Full signature parity with LLMProvider.complete_chat, deliberately.
+        # This fake is imported by four other test modules, so every kwarg the
+        # real call site might start passing has to be accepted here or the
+        # breakage lands somewhere that has nothing to do with the change.
+        self.last_session = session
         self.last_messages = messages
         self.last_params = params
         text = self.responses[min(self.calls, len(self.responses) - 1)]
@@ -130,6 +137,18 @@ async def _run(ctx, provider, monkeypatch, attempt=1, retrieval_rounds=3):
     payload = {"run_id": "r", "task_id": "T-1", "spec": _spec(),
                "cand_id": "w", "attempt": attempt, "feedback": ""}
     return await worker_mod.run_candidate(ctx, payload)
+
+
+async def test_the_candidate_dispatch_carries_a_session_key(tmp_path, monkeypatch):
+    """The worker used to call `complete_chat` with no `session`, so a CLI-backed
+    candidate re-sent its whole conversation on every retrieval round and every
+    retry. The key is opaque and stateless providers ignore it, but it has to
+    actually be passed — and it has to be the same key `nodes.integrator` ends,
+    which is why both derive it from RunContext rather than a format string."""
+    ctx, _ = _ctx(tmp_path)
+    provider = ScriptedProvider(['<file path="a.txt">\nhello\n</file>'])
+    await _run(ctx, provider, monkeypatch)
+    assert provider.last_session == ctx.worker_session_key("T-1", "w")
 
 
 async def test_grep_then_patch_passes(tmp_path, monkeypatch):

@@ -34,6 +34,7 @@ from collections.abc import Callable
 from pathlib import Path
 
 from ..core.errors import LimitExhausted, OrchestratorError
+from ..ops.pricing import build_price_table, price
 from ._process import CliTimeout, stream_cli
 from .base import LLMProvider, LLMResult
 
@@ -56,6 +57,18 @@ _SANDBOX_MODES = {"read-only", "workspace-write", "danger-full-access"}
 
 class CodexCliProvider(LLMProvider):
     type = "codex_cli"
+    # `codex exec` exposes no verified reasoning-effort flag, so a level meant
+    # for the claude_cli tier is dropped here rather than mistranslated into a
+    # setting nobody has checked against the CLI's own --help.
+    supports_effort = False
+    #: Same reasoning as ClaudeCliProvider: a CLI call is a whole runtime, not a
+    #: socket, and the default worker fan-out would start nine of them at once.
+    #: Override with `providers.<name>.max_concurrency`.
+    default_max_concurrency = 2
+
+    #: Memoized price table (see _prices). Class-level so the base __init__ needs
+    #: no override; the first call replaces it with a per-instance dict.
+    _price_table: dict[str, dict] | None = None
 
     def _sandbox_mode(self) -> str:
         """Map allowed_tools -> a codex --sandbox mode. Anything that isn't an
@@ -139,7 +152,9 @@ class CodexCliProvider(LLMProvider):
         # `effort` likewise: `codex exec` has no verified equivalent flag, so a
         # level configured for the claude_cli tier is inapplicable here rather
         # than mistranslated into a setting we have not checked. Flipping
-        # smart_provider to codex_cli therefore drops effort control, by design.
+        # smart_provider to codex_cli therefore drops effort control, by design
+        # — and says so once per (provider, model) rather than silently.
+        self._warn_unsupported_effort(model, effort)
         # `params` (sampling overrides) is accepted for signature parity and
         # ignored: `codex exec` has no convenient temperature flag, and the spec
         # is explicit about not forcing one on the CLI tier.
@@ -191,8 +206,11 @@ class CodexCliProvider(LLMProvider):
                 on_progress({"phase": "event", "text": line[:200]})
 
         try:
-            run = await stream_cli(args, cwd=cwd, idle_timeout_s=idle_s,
-                                   total_timeout_s=total_s, on_line=on_line)
+            # Held only while the process is alive (see _concurrency_gate): the
+            # bounded resource is the running CLI, not this coroutine.
+            async with self._concurrency_gate():
+                run = await stream_cli(args, cwd=cwd, idle_timeout_s=idle_s,
+                                       total_timeout_s=total_s, on_line=on_line)
         except CliTimeout as e:
             _safe_unlink(last_msg_path)
             raise OrchestratorError(f"codex CLI {e}") from e
@@ -213,27 +231,36 @@ class CodexCliProvider(LLMProvider):
         if file_text:
             text = file_text
 
-        # Subscription auth (default): logged, not counted (cost 0, like
-        # claude_cli). API auth: try the price table; unknown model -> 0.
-        cost = 0.0
-        if self.pcfg.get("auth", "subscription") == "api":
-            cost = self._priced(model, in_tok, out_tok)
-
         # Codex reports `input_tokens` as the TOTAL prompt (cached bytes included),
         # unlike the Anthropic shape — so hit is the reported cached count and miss
         # is the remainder, preserving hit + miss == input_tokens.
         hit = min(cached, in_tok)
+        miss = max(in_tok - hit, 0)
+
+        # Subscription auth (default): logged, not counted (cost 0, like
+        # claude_cli). API auth: try the price table; unknown model -> 0. The
+        # cache split is handed to pricing so a warm codex prefix is charged at
+        # the entry's cache_read rate when it declares one.
+        cost = 0.0
+        if self.pcfg.get("auth", "subscription") == "api":
+            cost = price(self._prices().get(model), in_tok, out_tok, hit, miss)
+
         return LLMResult(text=text, input_tokens=in_tok, output_tokens=out_tok,
                          cost_usd=cost, model=model, raw=out,
-                         cache_hit_tokens=hit, cache_miss_tokens=max(in_tok - hit, 0))
+                         cache_hit_tokens=hit, cache_miss_tokens=miss)
 
-    def _priced(self, model: str, in_tok: int, out_tok: int) -> float:
-        for wm in (self.cfg.get("worker_models") or {}).keys():
-            entry = self.cfg.worker_models.get(wm)
-            if entry and entry.get("provider") == self.name and entry.get("model") == model:
-                return (in_tok / 1e6 * float(entry.get("input_per_mtok", 0))
-                        + out_tok / 1e6 * float(entry.get("output_per_mtok", 0)))
-        return 0.0
+    def _prices(self) -> dict[str, dict]:
+        """This provider's price table, built once and memoized.
+
+        Lazy rather than built in __init__ because the overwhelmingly common
+        case is `auth: subscription`, where nothing is ever priced and the table
+        would be pure cost. Built by ops.pricing from presets ∪ worker_models ∪
+        roles — the same table openai_compatible and Budget use, so all three
+        agree on what a call costs.
+        """
+        if self._price_table is None:
+            self._price_table = build_price_table(self.cfg, self.name)
+        return self._price_table
 
 
 def _cached_input_tokens(usage: dict) -> int:

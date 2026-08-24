@@ -237,9 +237,28 @@ async def run_candidate(ctx: RunContext, payload: dict) -> dict:
                 provider_type=provider.type, model=model,
                 prompt_chars=len(system) + sum(len(m["content"]) for m in messages),
                 max_output_tokens=(params or {}).get("max_tokens"))
+            # `session` is an opaque continuity key. On the HTTP tier it is
+            # ignored (stateless endpoint, session_active() is False, the whole
+            # messages array goes every time). On a CLI backend it is what turns
+            # this loop from N cold processes into one resumed conversation:
+            # without it every retrieval round and every retry re-sends the
+            # frozen file prefix and all prior answers as fresh input.
+            #
+            # ►► NOTE FOR THE NEXT READER: `allowed_tools` is deliberately NOT
+            # passed. A CLI worker keeps the provider-wide read-only set
+            # (`Read,Grep,Glob`) and answers in <file>/<edit> blocks like every
+            # other worker. Granting it `Edit,Write` looks like an obvious
+            # improvement — it is not. The block protocol is what routes every
+            # write through `ops.patch.apply_response`, which is the only place
+            # that enforces the spec's `files_write` allowlist (containment check
+            # at ops/patch.py) and therefore the only reason the scheduler's
+            # disjoint-write invariant (engine/scheduler.py) holds and the gate's
+            # diff attribution means anything. A CLI holding write tools would
+            # bypass all three, silently, from inside the worktree.
             result = await provider.complete_chat(
                 model=model, system=system, messages=messages, cwd=cwd,
-                params=params, effort=ctx.worker_effort(cand_id))
+                params=params, effort=ctx.worker_effort(cand_id),
+                session=ctx.worker_session_key(task_id, cand_id))
             messages.append({"role": "assistant", "content": result.text})
             ctx.budget.record(
                 task_id=task_id, role=f"worker:{cand_id}", provider=provider_name,

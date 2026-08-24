@@ -24,12 +24,15 @@ import time
 from .engine import runner
 from .core.config import load_config
 from .core.errors import PlannerNeedsInput
+from .core.validate import validate_config
 from .nodes.discuss import run_discuss
 from .nodes.planner import (import_backlog_stubs, needs_plan_ids as plan_batch_ids,
                             plan)
 from .engine.scheduler import queue_stats
 from .ops import liveness
 from .ops.store import Store
+
+log = logging.getLogger("orchestrator.cli")
 
 
 def _setup_logging(verbose: bool) -> None:
@@ -144,10 +147,36 @@ def _print_metrics(store) -> None:
         print("  (no completed tasks yet — per-task figures need a finished run)")
 
 
+#: Commands that can dispatch an LLM call. Config is validated before these and
+#: only these: `status`, `metrics`, `reconcile` and friends must keep working on
+#: a half-configured project — being able to read the ledger of a run that
+#: failed for a config reason is exactly when you need them.
+_SPENDING_COMMANDS = ("plan", "discuss", "run", "resume")
+
+
 def main(argv: list[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
     _setup_logging(args.verbose)
     cfg = load_config(args.project)
+
+    if args.command in _SPENDING_COMMANDS:
+        # Before the first call, not on task 7: a typo'd preset or a missing API
+        # key would otherwise surface minutes into a run, after the tasks that
+        # happened to come first had already been paid for.
+        # A dry run opens no socket and `plan`/`discuss` never reach the worker
+        # pool, so the two checks that only matter for a real dispatch are
+        # downgraded to warnings for them (see validate_config).
+        report = validate_config(
+            cfg,
+            will_spend=not getattr(args, "dry_run", False),
+            dispatches_workers=args.command in ("run", "resume"),
+        )
+        for warning in report.warnings:
+            log.warning("config: %s", warning)
+        if not report.ok:
+            print(f"config problems in project {cfg.project_name!r} — "
+                  f"nothing was run:\n{report.format_errors()}", file=sys.stderr)
+            return 2
 
     if args.command == "plan":
         store = Store(cfg.store_path())

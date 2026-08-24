@@ -125,6 +125,19 @@ class _LiveSession:
 
 class ClaudeCliProvider(LLMProvider):
     type = "claude_cli"
+    # `--effort <level>` is a real flag on this CLI (EFFORT_LEVELS above), so a
+    # level passed here reaches the backend and `core.validate` need not warn
+    # about a binding that sets one.
+    supports_effort = True
+    #: Default ceiling on simultaneous `claude -p` processes (see
+    #: LLMProvider._concurrency_gate). Two, not nine: each call is a full Node
+    #: runtime doing tool work against one subscription, so the default worker
+    #: fan-out (3 tasks x 3 candidates) would spend the first minute of every
+    #: run collecting rate-limit errors. Two keeps a second candidate genuinely
+    #: overlapping the first — the point of best-of-N — without racing the
+    #: limit. Raise it with `providers.<name>.max_concurrency` once you have
+    #: measured that your plan tolerates more.
+    default_max_concurrency = 2
 
     def __init__(self, name, pcfg, cfg):
         super().__init__(name, pcfg, cfg)
@@ -254,9 +267,13 @@ class ClaudeCliProvider(LLMProvider):
 
             sink = _EventSink(on_progress, root=cwd)
             try:
-                run = await stream_cli(
-                    args, cwd=cwd, idle_timeout_s=idle_s,
-                    total_timeout_s=total_s, on_line=sink.feed)
+                # The ceiling is held only while a process is actually alive —
+                # not across the backoff sleep below, and not while we parse the
+                # result. The scarce thing is the running CLI, not this coroutine.
+                async with self._concurrency_gate():
+                    run = await stream_cli(
+                        args, cwd=cwd, idle_timeout_s=idle_s,
+                        total_timeout_s=total_s, on_line=sink.feed)
             except CliTimeout as e:
                 # An idle kill means the process wedged and produced nothing —
                 # the one timeout worth retrying. Blowing the absolute ceiling
@@ -350,6 +367,62 @@ class ClaudeCliProvider(LLMProvider):
         # fall out of it returning None.
         raise last_error or OrchestratorError("claude CLI made no attempts")
 
+    async def complete_chat(self, *, model: str, system: str,
+                            messages: list[dict], cwd: str | None = None,
+                            params: dict | None = None,
+                            session: str | None = None,
+                            effort: str | None = None,
+                            allowed_tools: str | None = None,
+                            mcp_config: str | None = None,
+                            on_progress: Callable[[dict], None] | None = None
+                            ) -> LLMResult:
+        """Continue the pinned conversation instead of re-sending it.
+
+        The inherited implementation flattens EVERY turn into one `-p` prompt.
+        That is correct for a stateless CLI call and ruinous for a warm loop: a
+        worker's retrieval rounds and retry feedback each re-send the whole
+        accumulated conversation — the frozen file prefix, every grep result,
+        every prior answer — as fresh input, on a tier whose binding constraint
+        is subscription tokens. The session machinery that made the planner chat
+        cheap was already here; the worker path simply never asked for it.
+
+        So: when `session_active(key)` says the CLI still holds this
+        conversation, send only what the caller has appended since the CLI's own
+        last reply, and let `--resume` supply the rest. Otherwise send the full
+        flattened history, which is exactly today's behaviour — and is what the
+        FIRST turn of every loop does, since no session is active yet.
+
+        The `session_active` check happens BEFORE the payload is built, the same
+        ordering `nodes.planner.plan_or_ask` uses, because the answer decides
+        what to build, not how to send it.
+        """
+        newest = _turns_since_last_reply(messages)
+        if not (session and newest and self.session_active(session)):
+            return await super().complete_chat(
+                model=model, system=system, messages=messages, cwd=cwd,
+                params=params, session=session, effort=effort,
+                allowed_tools=allowed_tools, mcp_config=mcp_config,
+                on_progress=on_progress)
+        try:
+            return await self.complete(
+                model=model, system=system, user=newest, cwd=cwd, params=params,
+                session=session, effort=effort, allowed_tools=allowed_tools,
+                mcp_config=mcp_config, on_progress=on_progress)
+        except SessionLost:
+            # The abbreviated payload has no meaning without the conversation it
+            # referred to. `_raise_if_session_lost` already dropped the dead id,
+            # so this call opens a fresh session and carries the whole history
+            # into it — ONCE. Not a loop: a second failure is a real failure, and
+            # retrying a full history repeatedly is the expensive way to find
+            # that out. Same shape as the planner's recovery.
+            log.warning("claude CLI lost session %s mid-conversation; resending "
+                        "the full history once", session)
+            return await super().complete_chat(
+                model=model, system=system, messages=messages, cwd=cwd,
+                params=params, session=session, effort=effort,
+                allowed_tools=allowed_tools, mcp_config=mcp_config,
+                on_progress=on_progress)
+
     def _build_args(self, *, model: str, system: str, user: str,
                     level: str | None, allowed_tools: str | None,
                     mcp_config: str | None, session_id: str | None,
@@ -418,6 +491,38 @@ class ClaudeCliProvider(LLMProvider):
         log.warning("claude CLI could not resume session %s; falling back to a "
                     "fresh one: %s", session, text.strip()[:200])
         raise SessionLost(f"claude CLI could not resume: {text.strip()[:300]}")
+
+
+def _turns_since_last_reply(messages: list[dict]) -> str:
+    """Everything the caller appended after the CLI's own most recent answer.
+
+    Walks BACKWARDS to the last `assistant` turn rather than just taking
+    `messages[-1]`, because a caller can legitimately append two turns between
+    calls — `nodes.worker` adds a retrieval-results turn and then, on the round
+    where the budget runs out, a "retrieval exhausted" instruction. Taking only
+    the last one would drop the results the instruction refers to.
+
+    Assistant turns are excluded because the CLI already has them: they came out
+    of this very session, and echoing them back would append a second copy of
+    the model's own answer to its context. System turns are excluded for the
+    same reason the base implementation excludes them — the system prompt
+    travels as `--append-system-prompt`, not as a turn.
+
+    Returns "" when the newest turn IS the assistant's, which the caller treats
+    as "nothing to abbreviate" and falls back to the full history.
+    """
+    tail: list[str] = []
+    for m in reversed(messages):
+        role = m.get("role")
+        if role == "assistant":
+            break
+        if role == "system":
+            continue
+        content = m.get("content") or ""
+        if content:
+            tail.append(content)
+    tail.reverse()
+    return "\n\n".join(tail)
 
 
 def _limit_exhausted(detail: str, rate_limit: dict | None) -> LimitExhausted:

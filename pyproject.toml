@@ -4,6 +4,12 @@ version = "0.1.0"
 description = "Project-agnostic LangGraph multi-agent development orchestrator — plug in any repo with a gate + backlog protocol"
 requires-python = ">=3.10"
 dependencies = [
+    # Main deps, not an extra: a SHIPPED preset names each of these backends, so
+    # a fresh install has to be able to run one without a second install step.
+    # The SDK imports are module-local inside the provider classes all the same,
+    # so a stripped environment degrades to one clear error on one binding
+    # instead of an ImportError that takes the whole orchestrator down.
+    "anthropic>=0.40",
     "langgraph>=1.0,<2",
     "langgraph-checkpoint-sqlite>=2.0.0",
     "openai>=1.60.0",

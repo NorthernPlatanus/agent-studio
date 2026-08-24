@@ -55,6 +55,11 @@ JOB_SPAWN_ERRORS: dict[int | str, dict[str, Any]] = {
     409: _r("a job is already in flight for this project, the profile has no "
             "project.repo_path, or the store does not exist yet"),
 }
+CONFIG_WRITE_ERRORS: dict[int | str, dict[str, Any]] = {
+    404: UNKNOWN_PROJECT,
+    409: _r("a job or a discuss session is live for this project, so its "
+            "assignment overlay is locked — the same one-writer rule as a spawn"),
+}
 DISCUSS_ERRORS: dict[int | str, dict[str, Any]] = {
     404: _r("unknown project, or unknown discuss session"),
     409: _r("a discuss session is already open for this project, or the profile "

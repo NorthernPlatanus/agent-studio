@@ -31,20 +31,34 @@ providers:
     api_key_env: COMETAPI_KEY
     timeout_s: 300
 
-# VERIFY exact model ids and prices against CometAPI's current list — ids rotate.
-# Best-of-N brainstorm: three DeepSeek V4 Flash candidates on ONE cheap model,
-# differentiated by CONSERVATIVE sampling + a static `approach` hint (appended to
-# the worker's stable prefix). Same model, three behaviors — good for comparing
-# how the model responds to different framings while the free gate culls losers.
+# Best-of-N brainstorm: three candidates on ONE model, differentiated by a static
+# `approach` hint appended to the worker's stable prefix. Same model, three
+# framings — good for comparing how the model responds while the free gate culls
+# the losers.
+#
+# `preset:` (see the `presets:` block in config/default.yaml) supplies provider,
+# model, effort and the whole price shape. Do NOT restate any of those here: an
+# inline `provider:`/`model:`/`*_per_mtok` WINS over the preset, which is how a
+# rebind silently does nothing. Keys the preset does not own — `approach`,
+# `params`, a role's `allowed_tools` — stay on the entry.
+#
+# NO `params: {temperature: ...}`. This tier used to differentiate that way; a
+# reasoning model rejects `temperature`, the tolerant-400 retry strips it, and
+# best-of-3 collapses into one call billed three times. `approach` is the axis
+# that survives, and it costs nothing extra because it lands AFTER the cached
+# prefix — all three candidates share one cached prompt.
+#
+# To run the cheap OpenAI-compatible tier instead, swap the preset for
+# `deepseek_flash` (still shipped); for a subscription CLI, `claude_cli_sonnet`.
 # NOTE: `approach` is static config for now; a future version may let the planner
 # assign it per-task (see the gitignored docs/FUTURE_NOTES.md).
 worker_models:
-  flash_lo:  {provider: cometapi, model: deepseek-v4-flash, input_per_mtok: 0.12, output_per_mtok: 0.24,
-              params: {temperature: 0.2}, approach: "Simplest correct solution. Minimal diff, no refactoring beyond the task, no cleverness."}
-  flash_mid: {provider: cometapi, model: deepseek-v4-flash, input_per_mtok: 0.12, output_per_mtok: 0.24,
-              params: {temperature: 0.5}, approach: "Balanced: correct, readable, idiomatic to the surrounding code."}
-  flash_hi:  {provider: cometapi, model: deepseek-v4-flash, input_per_mtok: 0.12, output_per_mtok: 0.24,
-              params: {temperature: 0.8}, approach: "Thorough: handle edge cases, invalid input, and error paths explicitly."}
+  flash_lo:  {preset: luna_high,
+              approach: "Simplest correct solution. Minimal diff, no refactoring beyond the task, no cleverness."}
+  flash_mid: {preset: luna_high,
+              approach: "Balanced: correct, readable, idiomatic to the surrounding code."}
+  flash_hi:  {preset: luna_high,
+              approach: "Thorough: handle edge cases, invalid input, and error paths explicitly."}
 
 roles:
   # smart_provider drives BOTH planner and reviewer (the whole "thinking tier").

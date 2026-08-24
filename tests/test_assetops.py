@@ -154,7 +154,10 @@ class ScriptedProvider:
         self.text = text
 
     async def complete_chat(self, *, model, system, messages, cwd=None,
-                            params=None, session=None, effort=None):
+                            params=None, session=None, effort=None,
+                            allowed_tools=None, mcp_config=None,
+                            on_progress=None):
+        # Signature parity with LLMProvider.complete_chat — see test_worker_loop.
         from orchestrator.providers.base import LLMResult
         return LLMResult(text=self.text)
 

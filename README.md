@@ -24,7 +24,7 @@ Two tiers of intelligence, priced accordingly:
 |---|---|---|---|
 | Planner (tech-lead) | Opus **or** GPT-5.6 | Claude Code CLI / Codex CLI | subscription (weekly limit) |
 | Reviewer (rubric) | Opus **or** GPT-5.6 | Claude Code CLI / Codex CLI | subscription |
-| Workers | DeepSeek V4 Flash / GLM / Kimi | CometAPI (OpenAI-compatible) | cents |
+| Workers | GPT-5.6 Luna (default) — or any preset: DeepSeek/GLM/Kimi, Claude/Codex CLI | OpenAI Responses, OpenAI-compatible, Anthropic, or a local CLI | cents (or subscription) |
 | Escalation senior | subscription Opus/Sonnet or GPT-5.6 | CLI (patch→gate, not repo edits) | subscription |
 | Scheduler, Gate, Integrator, Retrieval, Visual gate | — | pure Python + git | **zero** |
 

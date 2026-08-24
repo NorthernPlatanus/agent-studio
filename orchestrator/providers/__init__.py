@@ -4,15 +4,19 @@ from __future__ import annotations
 
 import weakref
 
+from .anthropic_api import AnthropicApiProvider
 from .base import LLMProvider, LLMResult
 from .claude_cli import ClaudeCliProvider
 from .codex_cli import CodexCliProvider
 from .openai_compatible import OpenAICompatibleProvider
+from .openai_responses import OpenAIResponsesProvider
 
 PROVIDER_TYPES: dict[str, type[LLMProvider]] = {
+    "anthropic_api": AnthropicApiProvider,
     "claude_cli": ClaudeCliProvider,
     "codex_cli": CodexCliProvider,
     "openai_compatible": OpenAICompatibleProvider,
+    "openai_responses": OpenAIResponsesProvider,
 }
 
 # Provider instances are cached PER Config (not process-globally by name): a

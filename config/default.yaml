@@ -68,6 +68,20 @@ providers:
     # attempt's CLI session, so it keeps that exploration instead of paying for
     # it twice.
     retry_attempts: 2
+    # ── Ceiling on simultaneous `claude -p` processes ────────────────────────
+    # Nothing above this bounds LLM concurrency: the effective number of calls
+    # in flight is run.max_parallel_tasks x len(roles.worker.candidates) — 3 x 3
+    # by default — and each one here is a whole Node runtime doing tool work
+    # against ONE subscription. Nine at once hits the rate limit almost
+    # immediately, and a limit error is not local damage: the batch runner waits
+    # with FIRST_EXCEPTION, so it cancels every sibling task with it.
+    #
+    # Two keeps a second candidate genuinely overlapping the first (the point of
+    # best-of-N) without racing the limit. The excess queues on a semaphore held
+    # by the provider instance; it is never dropped. null or 0 = unbounded.
+    # `orchestrator run` warns at startup when the candidate pool is wider than
+    # this, because then the pool costs best-of-3 money at best-of-2 speed.
+    max_concurrency: 2
     # TIER-WIDE fallback reasoning effort: low | medium | high | xhigh | max.
     # null leaves the CLI's own default alone. Per-role keys win over this —
     # roles.planner.effort, roles.reviewer.effort, run.escalate_effort — because
@@ -92,8 +106,124 @@ providers:
                                     # Removes the sandbox — enable ONLY inside a disposable worktree/container.
     idle_timeout_s: 300             # see claude_cli above — silence, not wall clock
     timeout_s: 3600                 # absolute backstop; null disables
+    max_concurrency: 2              # see claude_cli above — one runtime per call, one subscription
+  # ── Metered HTTP tiers ────────────────────────────────────────────────────
+  # These spend CASH, not subscription quota, so every call lands in the ledger's
+  # cash channel and counts against budget.per_task_usd / per_run_usd. Defined
+  # here so the presets below are complete bindings out of the box; a provider
+  # nothing points at is inert — no client is constructed and no key is read.
+  # A missing API key on a provider a role or worker actually uses is a STARTUP
+  # ERROR (core/validate.py), not a 401 discovered on task 7.
+  openai:
+    type: openai_responses          # provider type lands with the Responses client
+    base_url: https://api.openai.com/v1
+    api_key_env: OPENAI_API_KEY
+    timeout_s: 300
+  anthropic:
+    type: anthropic_api             # provider type lands with the Messages client
+    api_key_env: ANTHROPIC_API_KEY
+    timeout_s: 300
+  # CometAPI: one OpenAI-compatible endpoint fronting DeepSeek/GLM/Kimi/etc.
+  # Here rather than only in a project profile because the deepseek_flash preset
+  # below names it, and a preset whose provider is undefined is a binding that
+  # cannot bind.
+  cometapi:
+    type: openai_compatible
+    base_url: https://api.cometapi.com/v1
+    api_key_env: COMETAPI_KEY
+    timeout_s: 300
 
-worker_models: {}     # per project: name -> {provider, model, input_per_mtok, output_per_mtok}
+# ============================================================================
+# PRESETS — named, complete backend bindings.
+# ============================================================================
+# A preset answers one question in one place: "what does it mean to run on this
+# backend?" — which provider, which model id, what reasoning effort, and what it
+# costs. `worker_models.<key>` and `roles.<role>` point at one with
+# `preset: <name>`; the preset fills in provider/model/effort/prices and any key
+# written explicitly on the entry still wins. An entry with no `preset:` behaves
+# exactly as it always did.
+#
+# WHY a layer instead of repeating five keys per entry: moving a worker between
+# a metered API and a CLI riding an existing subscription is the change the cost
+# question actually turns on, and it should be a one-line edit that no code
+# knows about. It is also the list the Studio UI binds against — the panel picks
+# a preset, it never defines one, so nothing a browser sends can become a
+# base_url, an argv, an API key or a price.
+#
+# Project profiles may add or override presets (this section deep-merges like
+# every other). Env overrides cannot reach in here: ORCH_<SECTION>_<KEY> is one
+# level deep by design.
+presets:
+  # ── GPT-5.6 Luna (metered) ──────────────────────────────────────────────
+  # Three efforts, one model. Diversify a best-of-N pool by EFFORT and by the
+  # per-worker `approach` hint — never by temperature: reasoning models reject
+  # `temperature`, the tolerant-400 retry strips it, and three "diverse"
+  # candidates collapse into three identical calls at 3x the price. Config
+  # validation warns when a pool collapses that way.
+  luna_high:
+    label: "GPT-5.6 Luna · high"
+    provider: openai              # key into providers: above
+    model: gpt-5.6-luna
+    effort: high                  # none | low | medium | high | xhigh | max
+    input_per_mtok: 0.20
+    output_per_mtok: 1.20
+    # Cache tiers: a cached input token is 10x cheaper than a fresh one. Absent,
+    # both hit and miss fall back to input_per_mtok — i.e. the flat pricing every
+    # entry had before, so nothing regresses for a model with no cache rates.
+    #
+    # NO cache_write_per_mtok here, on purpose. `cache_miss` in this codebase is
+    # "input tokens not served from cache" (openai_compatible._cache_tokens
+    # derives it as in_tok - hit), which is NOT the same set as "tokens written
+    # to the cache" — it also covers the volatile suffix that never gets cached
+    # at all. Pricing all of it at a write premium would inflate every cold call
+    # by 25%, and input dominates this workload, so the ledger's cash column
+    # would read high across the board. A write rate belongs here only once a
+    # provider reports a distinct cache-creation count (the Anthropic shape) and
+    # LLMResult carries it as its own channel.
+    cache_read_per_mtok: 0.02
+    # THE LONG-CONTEXT CLIFF. Above the threshold the provider re-prices the
+    # ENTIRE request — not the overflow — so a 300K-token call costs 2x input and
+    # 1.5x output on every token in it, including the first. Modelled explicitly
+    # because the alternative is a ledger that understates a big call by ~2x and
+    # a pre-flight budget guard that waves through calls it should have refused.
+    long_context: {threshold_in_tok: 272000, input_multiplier: 2.0, output_multiplier: 1.5}
+  luna_med:
+    label: "GPT-5.6 Luna · medium"
+    provider: openai
+    model: gpt-5.6-luna
+    effort: medium
+    input_per_mtok: 0.20
+    output_per_mtok: 1.20
+    cache_read_per_mtok: 0.02
+    long_context: {threshold_in_tok: 272000, input_multiplier: 2.0, output_multiplier: 1.5}
+  luna_xhigh:
+    label: "GPT-5.6 Luna · xhigh"
+    provider: openai
+    model: gpt-5.6-luna
+    effort: xhigh
+    input_per_mtok: 0.20
+    output_per_mtok: 1.20
+    cache_read_per_mtok: 0.02
+    long_context: {threshold_in_tok: 272000, input_multiplier: 2.0, output_multiplier: 1.5}
+  # ── Subscription CLIs ───────────────────────────────────────────────────
+  # No prices, deliberately: these ride an existing subscription, so their calls
+  # are logged in the ledger's SUBSCRIPTION channel at $0 cash and are never
+  # summed with the cash column. The flip side is that they have no cash ceiling
+  # at all — budget.per_task_usd cannot bound a tier that spends no cash, and
+  # only the run's idle/total clocks do.
+  claude_cli_sonnet: {label: "Claude Code CLI · sonnet", provider: claude_cli, model: sonnet, effort: medium}
+  claude_cli_opus:   {label: "Claude Code CLI · opus",   provider: claude_cli, model: opus,   effort: high}
+  codex_cli_default: {label: "Codex CLI", provider: codex_cli, model: gpt-5.6-terra}
+  # ── Demoted, not deleted ────────────────────────────────────────────────
+  # DeepSeek V4 Flash was the whole worker tier until its price moved. It stays
+  # selectable so the comparison is one config line, not a code change.
+  deepseek_flash:    {label: "DeepSeek V4 Flash (CometAPI)", provider: cometapi, model: deepseek-v4-flash,
+                      input_per_mtok: 0.12, output_per_mtok: 0.24}
+
+# per project: name -> {provider, model, input_per_mtok, output_per_mtok}, or
+# `{preset: <name>}` plus whatever that preset should not decide for this entry
+# (`params`, `approach`, an overriding `effort`).
+worker_models: {}
 
 roles:
   # smart_provider drives BOTH planner and reviewer (the whole "thinking tier").
@@ -104,6 +234,10 @@ roles:
   # `effort` (low|medium|high|xhigh|max) is per-role and overrides the tier-wide
   # providers.<name>.effort. Only reasoning-capable providers use it; codex_cli
   # and openai_compatible ignore it.
+  # A role may name a `preset:` instead of provider/model/effort — e.g.
+  # `planner: {preset: claude_cli_opus}`. Keys written here still win over the
+  # preset, and `null` means "unset", not "override with nothing", so the
+  # `provider: null` below keeps inheriting rather than blanking a preset.
   planner:  {provider: null, model: opus, effort: null}
   reviewer: {provider: null, model: opus, effort: null}
   # The visual verifier (see `verify:` below). `allowed_tools` is per-role on

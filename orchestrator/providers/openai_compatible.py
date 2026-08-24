@@ -1,38 +1,40 @@
 """OpenAI-compatible endpoint provider (CometAPI, OpenRouter, vLLM, ...).
 
-Cost is derived from the project's worker_models price table (the aggregator
-response usually doesn't carry pricing).
+Cost is derived from the config's price table (the aggregator response usually
+doesn't carry pricing) — see ops/pricing.py, which builds it from
+presets ∪ worker_models ∪ roles and owns the cache-tier and long-context rules.
 """
 
 from __future__ import annotations
 
 import logging
 import os
-import re
 from collections.abc import Callable
 
 from openai import AsyncOpenAI
 
 from ..core.errors import OrchestratorError
+from ..ops.pricing import build_price_table, price
+from ._openai_shared import (CHAT_SAMPLING_KEYS, _cache_tokens, _names_param,
+                             _safe_params)
 from .base import LLMProvider, LLMResult
 
 log = logging.getLogger("orchestrator.openai_compatible")
 
-# Sampling/generation knobs we forward to chat.completions.create(). A stray key
-# outside this set is dropped BEFORE the call (an unknown kwarg is a client-side
-# TypeError otherwise); a whitelisted key the endpoint still rejects at runtime
-# (e.g. `seed` on a provider that doesn't implement it) is dropped by the
-# tolerant 400 retry in _chat. `extra_body` is the escape hatch for
-# provider-specific fields (top_k, min_p, repetition_penalty, ...).
-_SAMPLING_KEYS = frozenset({
-    "temperature", "top_p", "frequency_penalty", "presence_penalty", "seed",
-    "stop", "max_tokens", "max_completion_tokens", "logit_bias", "n",
-    "logprobs", "top_logprobs", "response_format", "extra_body",
-})
+# The forwarded-param whitelist and the three helpers below it moved to
+# _openai_shared when openai_responses needed the same mechanics; the comment
+# explaining each one moved with it. Re-exported under the old name because it
+# reads as this provider's own vocabulary at the call site (and because
+# `_safe_params` defaults to exactly this set).
+_SAMPLING_KEYS = CHAT_SAMPLING_KEYS
 
 
 class OpenAICompatibleProvider(LLMProvider):
     type = "openai_compatible"
+    # /v1/chat/completions has no reasoning dial for the models this endpoint
+    # fronts, so a level passed here is dropped — loudly now (see
+    # LLMProvider._warn_unsupported_effort) instead of by a code comment alone.
+    supports_effort = False
 
     def __init__(self, name, pcfg, cfg):
         super().__init__(name, pcfg, cfg)
@@ -46,15 +48,12 @@ class OpenAICompatibleProvider(LLMProvider):
             timeout=float(pcfg.get("timeout_s", 300)),
             max_retries=2,
         )
-        # model id -> (in $/Mtok, out $/Mtok)
-        self.prices: dict[str, tuple[float, float]] = {}
-        for wm in (cfg.get("worker_models") or {}).keys():
-            entry = cfg.worker_models.get(wm)
-            if entry.provider == name:
-                self.prices[entry.model] = (
-                    float(entry.get("input_per_mtok", 0)),
-                    float(entry.get("output_per_mtok", 0)),
-                )
+        # model id -> pricing entry. Built by ops.pricing from presets ∪
+        # worker_models ∪ roles: this table used to be built here from
+        # worker_models alone, so a planner or reviewer pointed at an HTTP
+        # provider recorded every call at $0.00 — a whole tier of real spend
+        # missing from the ledger and from the budget guard that reads it.
+        self.prices: dict[str, dict] = build_price_table(cfg, name)
 
     async def complete(self, *, model: str, system: str, user: str,
                        cwd: str | None = None,
@@ -72,7 +71,10 @@ class OpenAICompatibleProvider(LLMProvider):
         # full messages array IS the context (and session_active() says False, so
         # callers never abbreviate on this provider). `effort` is ignored too —
         # the cheap worker models have no reasoning-effort dial, and callers pass
-        # None for them anyway (RunContext.worker_effort).
+        # None for them anyway (RunContext.worker_effort) — but when one does not,
+        # the drop is now announced once per (provider, model) rather than
+        # inferred from reading this comment.
+        self._warn_unsupported_effort(model, effort)
         return await self._chat(model, [
             {"role": "system", "content": system},
             {"role": "user", "content": user},
@@ -89,7 +91,10 @@ class OpenAICompatibleProvider(LLMProvider):
                             ) -> LLMResult:
         """Pass the native OpenAI messages array through so the endpoint's
         automatic prefix caching sees a byte-stable prefix across turns.
-        `session`/`effort`/`on_progress` are accepted for parity and ignored."""
+        `session`/`effort`/`on_progress` are accepted for parity and ignored —
+        `effort` audibly so (a warning per provider/model), since a dropped
+        reasoning level is invisible in the result."""
+        self._warn_unsupported_effort(model, effort)
         wire = [{"role": "system", "content": system}] + [
             {"role": m["role"], "content": m["content"]} for m in messages
             if m.get("role") != "system"]
@@ -103,8 +108,13 @@ class OpenAICompatibleProvider(LLMProvider):
         attempted = _safe_params(params)
         while True:
             try:
-                resp = await self.client.chat.completions.create(
-                    model=model, messages=messages, **attempted)
+                # Unbounded by default (see LLMProvider.default_max_concurrency)
+                # — the endpoint does its own admission control. The gate is here
+                # so `providers.<name>.max_concurrency` can still bound a proxy
+                # with a per-key concurrency limit of its own.
+                async with self._concurrency_gate():
+                    resp = await self.client.chat.completions.create(
+                        model=model, messages=messages, **attempted)
                 break
             except Exception as e:  # surfaced as a candidate failure, not a crash
                 rejected = ([k for k in attempted if _names_param(e, k)]
@@ -122,51 +132,11 @@ class OpenAICompatibleProvider(LLMProvider):
         in_tok = getattr(usage, "prompt_tokens", 0) or 0
         out_tok = getattr(usage, "completion_tokens", 0) or 0
         hit, miss = _cache_tokens(usage, in_tok)
-        pin, pout = self.prices.get(model, (0.0, 0.0))
-        cost = in_tok / 1e6 * pin + out_tok / 1e6 * pout
+        # Cache-aware: a hit is priced at the entry's cache_read rate when it
+        # declares one. With no cache rates configured this is exactly the old
+        # flat `in_tok * pin + out_tok * pout`.
+        cost = price(self.prices.get(model), in_tok, out_tok, hit, miss)
         return LLMResult(text=text, input_tokens=in_tok, output_tokens=out_tok,
                          cost_usd=cost, model=model, raw=resp,
                          cache_hit_tokens=hit, cache_miss_tokens=miss)
 
-
-def _safe_params(params: dict | None) -> dict:
-    """Keep only recognized sampling keys; warn on anything dropped (a stray
-    key would raise a client-side TypeError inside create())."""
-    if not params:
-        return {}
-    safe: dict = {}
-    unknown: list[str] = []
-    for k, v in dict(params).items():
-        if k in _SAMPLING_KEYS:
-            safe[k] = v
-        else:
-            unknown.append(k)
-    if unknown:
-        log.warning("dropping unrecognized sampling param(s): %s", ", ".join(unknown))
-    return safe
-
-
-def _names_param(err: Exception, key: str) -> bool:
-    """True if the error text names `key` as a standalone token — used to drop a
-    param the endpoint rejected (e.g. \"Unsupported parameter: 'seed'\") and retry."""
-    return re.search(rf"\b{re.escape(key)}\b", str(err)) is not None
-
-
-def _cache_tokens(usage, in_tok: int) -> tuple[int, int]:
-    """Extract cache-hit/miss input tokens from a usage object, tolerating the
-    several shapes providers use (DeepSeek prompt_cache_hit_tokens; OpenAI-style
-    prompt_tokens_details.cached_tokens). Returns (hit, miss); 0/in_tok if absent.
-    """
-    if usage is None:
-        return 0, 0
-    hit = getattr(usage, "prompt_cache_hit_tokens", None)
-    miss = getattr(usage, "prompt_cache_miss_tokens", None)
-    if hit is None:
-        details = getattr(usage, "prompt_tokens_details", None)
-        if isinstance(details, dict):
-            hit = details.get("cached_tokens")
-        elif details is not None:
-            hit = getattr(details, "cached_tokens", None)
-    hit = int(hit or 0)
-    miss = int(miss) if miss is not None else max(in_tok - hit, 0)
-    return hit, miss

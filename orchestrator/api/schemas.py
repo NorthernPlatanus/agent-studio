@@ -21,7 +21,8 @@ from __future__ import annotations
 import re
 from typing import Any, Literal
 
-from pydantic import BaseModel, Field, field_validator, model_validator
+from pydantic import (BaseModel, ConfigDict, Field, field_validator,
+                      model_validator)
 
 from ..ops import liveness
 
@@ -706,3 +707,146 @@ class JobAccepted(BaseModel):
         description="the exact command line spawned — the panel shows it so a "
                     "human can reproduce the job in a terminal")
     run_id: str | None = None
+
+
+# ---- config: backend presets and assignments -----------------------------
+#: The same five reasoning levels as `PlannerEffort`, aliased rather than
+#: redeclared so the two can never drift. The name says the general case:
+#: presets, workers and smart-tier roles all take an effort, not just the
+#: planner. (A bare `Literal` is inlined into each property's schema, so the
+#: alias costs the generated contract nothing.)
+EffortLevel = PlannerEffort
+
+#: Does this preset spend cash through an HTTP API, or ride a CLI's existing
+#: subscription? The panel shows it as a chip, because it is the whole economic
+#: question behind picking one.
+PresetKind = Literal["api", "cli"]
+
+#: Which layer bound a worker or a role: the hand-edited project profile, or the
+#: panel's own assignment overlay (`state/<project>.assignments.json`).
+AssignmentSource = Literal["profile", "overlay"]
+
+
+class Preset(BaseModel):
+    """One server-defined backend binding, as the panel may offer it.
+
+    **No field here names or carries an API key's value, and none ever may.**
+    The natural shape of "return the provider config" includes `api_key_env` and,
+    one careless step later, `os.environ[api_key_env]` — so the model has no key
+    field at all. `configured` is the boolean the UI actually needs, and
+    `configured_detail` may name the *environment variable* but never its
+    contents. `tests/api/test_config_endpoints.py` asserts that no value from
+    `os.environ` appears anywhere in the serialized response.
+    """
+
+    key: str = Field(description="the `presets:` key — what an assignment names")
+    label: str
+    kind: PresetKind
+    provider: str = Field(description="the `providers:` key this preset binds to")
+    provider_type: str = Field(description="providers.<provider>.type, e.g. "
+                                           "openai_responses or claude_cli")
+    model: str | None
+    models: list[str] = Field(
+        description="model ids this provider is known to serve, including this "
+                    "preset's own — so a hand-edited id never vanishes from its "
+                    "own dropdown")
+    efforts: list[EffortLevel] = Field(
+        description="levels that actually reach this backend; EMPTY when the "
+                    "provider type has no reasoning dial, so the UI can disable "
+                    "the control rather than offer a setting that gets dropped")
+    effort: EffortLevel | None = Field(
+        description="the preset's own configured effort; null when it sets none, "
+                    "or when the configured value is not a level this repo knows")
+    cash: bool = Field(
+        description="true when a call spends real money (metered API), false when "
+                    "it rides a CLI subscription. The two are reported side by "
+                    "side in the ledger and never summed")
+    input_per_mtok: float | None
+    output_per_mtok: float | None
+    configured: bool = Field(
+        description="the backend is usable from this server: an API provider's "
+                    "api_key_env is populated, or a CLI provider's binary "
+                    "resolves on PATH")
+    configured_detail: str | None = Field(
+        description="why it is not usable, or a caveat worth showing; null when "
+                    "there is nothing to say. Never contains a secret's value")
+
+
+class Presets(BaseModel):
+    """`GET …/config/presets` — the backends this project may bind to."""
+
+    project: str
+    presets: list[Preset]
+    efforts: list[EffortLevel] = Field(
+        description="every level the assignment writer accepts; a preset's own "
+                    "`efforts` narrows this to what its backend honors")
+
+
+class Assignment(BaseModel):
+    """One bound worker key or role, with the layer that bound it."""
+
+    key: str = Field(description="a worker_models key, or a role name")
+    label: str = Field(description="the bound preset's label, or a description of "
+                                   "the inline binding when no preset is named")
+    preset: str | None = Field(description="null for an entry that still spells "
+                                           "out provider/model inline")
+    effort: EffortLevel | None
+    source: AssignmentSource
+
+
+class Assignments(BaseModel):
+    """`GET/POST …/config/assignments` — who runs on what, and can it change now."""
+
+    project: str
+    workers: list[Assignment]
+    roles: list[Assignment]
+    default_worker: str | None = Field(description="roles.worker.default")
+    candidates: list[str] = Field(description="roles.worker.candidates — the "
+                                              "best-of-N pool")
+    locked: bool = Field(
+        description="a write would 409 right now. The form disables itself on "
+                    "this rather than failing on submit")
+    locked_reason: str | None
+
+
+class AssignmentUpdate(BaseModel):
+    """A preset binding for one worker or role. Two keys, and no others.
+
+    `extra="forbid"` is load-bearing, not tidiness: it is what keeps the overlay
+    from becoming a general-purpose config write endpoint. The panel binds to a
+    preset the server already defined; it never defines one, and nothing it sends
+    can become a base_url, an argv, an API key or a price.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    preset: str = Field(min_length=1, max_length=128,
+                        description="a key from GET …/config/presets")
+    effort: EffortLevel | None = Field(
+        None, description="null to inherit the preset's own effort")
+
+
+class AssignmentsRequest(BaseModel):
+    """`POST …/config/assignments` — the whole overlay, replaced.
+
+    Not a patch: the body IS the overlay after the call, so clearing a binding is
+    omitting its key rather than sending a sentinel. That keeps "reset this row to
+    the profile" and "reset everything" the same operation at one level of
+    nesting, and it means the file on disk is always exactly what the panel last
+    sent.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    workers: dict[str, AssignmentUpdate] = Field(
+        default_factory=dict, max_length=64,
+        description="worker_models key -> binding; keys must already exist")
+    roles: dict[str, AssignmentUpdate] = Field(
+        default_factory=dict, max_length=32,
+        description="role name -> binding; planner/reviewer/verifier, never "
+                    "`worker` (its pool has its own two fields below)")
+    default_worker: str | None = Field(
+        None, description="roles.worker.default; null leaves the profile's alone")
+    candidates: list[str] | None = Field(
+        None, max_length=32,
+        description="roles.worker.candidates; null leaves the profile's alone")

@@ -20,7 +20,8 @@ from fastapi.routing import APIRoute
 from starlette.responses import JSONResponse
 
 from .discuss import get_manager
-from .routers import discuss_, events, jobs, live_, projects, runs, tasks, usage
+from .routers import (config_, discuss_, events, jobs, live_, projects, runs,
+                      tasks, usage)
 from .schemas import Health
 
 API_VERSION = "0.1.0"
@@ -135,7 +136,8 @@ def create_app(*, cors_origins: tuple[str, ...] = DEV_ORIGINS) -> FastAPI:
     def healthz() -> Health:
         return Health(status="ok", version=API_VERSION)
 
-    for module in (projects, tasks, runs, usage, events, jobs, discuss_, live_):
+    for module in (projects, tasks, runs, usage, events, jobs, discuss_, config_,
+                   live_):
         app.include_router(module.router)
     return app
 

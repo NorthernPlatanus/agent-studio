@@ -30,6 +30,7 @@ from pathlib import Path
 import yaml
 from fastapi import Depends, HTTPException
 
+from ..core.assignments import overlay_path
 from ..core.config import Config, load_config
 from .schemas import RepoPathSource
 
@@ -84,6 +85,24 @@ class ProjectRegistry:
         if name not in self._cache:
             self._cache[name] = load_config(name, root=self.root)
         return self._cache[name]
+
+    def invalidate(self, name: str) -> None:
+        """Drop the cached `Config` so the next read re-merges every layer.
+
+        Called by the one endpoint that writes a config layer (the assignment
+        overlay). Without it the panel would show its own change only after a
+        server restart, since the cache above is for the process lifetime.
+
+        An INJECTED config is restored rather than dropped. Injected entries
+        (tests, the fixture smoke server) have no profile on disk, and the roots
+        they are handed deliberately contain no `projects/` tree at all — so
+        dropping one would make the next `config()` call raise
+        `FileNotFoundError` from `load_config` instead of serving a request.
+        """
+        if name in self._injected:
+            self._cache[name] = self._injected[name]
+        else:
+            self._cache.pop(name, None)
 
     def profile_repo_path(self, name: str) -> str | None:
         """`project.repo_path` as the project's OWN profile declares it.
@@ -199,6 +218,17 @@ def store_path(cfg: Config) -> Path | None:
 def checkpoint_path(cfg: Config) -> Path | None:
     state = _resolved_dir(cfg, "state_dir")
     return None if state is None else state / f"{cfg.project_name}.checkpoints.sqlite3"
+
+
+def assignments_path(cfg: Config) -> Path | None:
+    """The Studio assignment overlay for this project, or None with no state dir.
+
+    Beside the store, and resolved through `_resolved_dir` for the same reason:
+    reading it must not create the directory. The writer creates it, because a
+    project that has never run should still be configurable from the panel.
+    """
+    state = _resolved_dir(cfg, "state_dir")
+    return None if state is None else overlay_path(state, cfg.project_name)
 
 
 def open_read_only(path: Path) -> sqlite3.Connection:

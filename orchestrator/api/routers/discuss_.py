@@ -23,6 +23,7 @@ import json
 from fastapi import APIRouter, Body, Depends, Query, Request, status
 from sse_starlette.sse import EventSourceResponse
 
+from ...core.assignments import EFFORTS as assignment_efforts
 from ...core.config import Config
 from ...nodes.discuss import DiscussSettings
 from .. import discuss as discuss_mod
@@ -39,7 +40,10 @@ router = APIRouter(prefix="/api/projects/{project}", tags=["discuss"],
                    responses=DISCUSS_ERRORS)
 
 #: The efforts `providers.<name>.effort` accepts (config/default.yaml).
-EFFORTS = ["low", "medium", "high", "xhigh", "max"]
+#: Taken from `core.assignments` rather than spelled out again: the assignment
+#: overlay's writer validates against the same list, and a settings UI offering a
+#: level the writer would reject is the drift this endpoint exists to prevent.
+EFFORTS = list(assignment_efforts)
 
 
 # ---- projection ----------------------------------------------------------
