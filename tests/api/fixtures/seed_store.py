@@ -21,6 +21,14 @@ Two things are deliberate:
   went sideways: `escalated`, `no_patch`, `visual_gate_skipped`,
   `verify_unverifiable`, `crashed`.
 
+The **config** endpoints (`…/config/presets`, `…/config/assignments`) read no
+store at all, so they get a second seeder: `seed_assignments()` writes the panel's
+overlay next to the store, and `seed_config_root()` writes a throwaway config root
+— the committed `config/default.yaml` plus a PINNED profile — that an out-of-process
+server can be pointed at with `ProjectRegistry(root=…)`. Without it a captured
+config fixture would be whatever `projects/example/profile.yaml` (gitignored)
+happens to say on the machine that ran the capture.
+
 It writes a real store through `ops.store.Store`, so if the schema changes the
 fixture follows it automatically. Never point it at a live project's state dir:
 it refuses to write into a directory that already holds a store, but treat that
@@ -30,13 +38,16 @@ as a backstop, not as permission to aim it carelessly.
 from __future__ import annotations
 
 import json
+import shutil
 import sqlite3
 import sys
 from pathlib import Path
 from typing import Any
 
+import yaml
 from langgraph.checkpoint.sqlite import SqliteSaver
 
+from orchestrator.core.assignments import overlay_path, write_overlay
 from orchestrator.ops.store import Store
 
 PROJECT = "example"
@@ -283,13 +294,117 @@ def seed_checkpoint(checkpoint_path: Path) -> None:
         saver.put(config, checkpoint, {"source": "loop", "step": 4}, {})
 
 
+# ---- the config half: presets, assignments, and the overlay ---------------
+# `GET …/config/presets` and `GET …/config/assignments` read CONFIG, not the
+# store, so seeding a state dir is not enough to make them answer with anything.
+# Two of the three layers they read are machine-local: `projects/<name>/
+# profile.yaml` is gitignored and `config/local.yaml` is personal. A fixture
+# captured against those would be whatever this operator last wrote.
+#
+# So the config half is pinned here in the same spirit as the store half: an
+# explicit worker tier and role table, written out as a profile into a THROWAWAY
+# config root whose only other content is a copy of the committed
+# `config/default.yaml`. `presets:` and `providers:` therefore stay real — they
+# are the committed file, and a preset added there shows up in the next capture —
+# while `worker_models:` / `roles:` are fixed constants. `tests/api/
+# test_config_endpoints.py` pins its worker tier the same way and for the same
+# reason.
+REPO_ROOT = Path(__file__).resolve().parents[3]
+
+#: The worker tier the config fixtures assert against. Three rows, deliberately
+#: not alike: an inline binding that names no preset at all (the pre-preset shape
+#: every old profile still has), a row the PROFILE already binds to a preset, and
+#: a row the OVERLAY rebinds — which is the pair a naive projection conflates.
+WORKER_MODELS: dict[str, Any] = {
+    "flash_lo": {"provider": "cometapi", "model": "deepseek-v4-flash",
+                 "input_per_mtok": 0.12, "output_per_mtok": 0.24,
+                 "approach": "Simplest correct solution. Minimal diff."},
+    "flash_mid": {"preset": "deepseek_flash",
+                  "approach": "Balanced: correct, readable, idiomatic."},
+    "flash_hi": {"preset": "deepseek_flash",
+                 "approach": "Thorough: edge cases and error paths."},
+}
+
+ROLES: dict[str, Any] = {
+    "smart_provider": "claude_cli",
+    "planner": {"provider": None, "model": "opus", "effort": None},
+    "reviewer": {"provider": None, "model": "opus", "effort": None},
+    "verifier": {"provider": None, "model": "opus", "effort": None,
+                 "allowed_tools": None},
+    "worker": {"default": "flash_mid",
+               "candidates": ["flash_lo", "flash_mid", "flash_hi"]},
+}
+
+#: The assignment overlay the panel is imagined to have written: one WORKER moved
+#: off a metered API onto a CLI subscription (the move the preset layer exists
+#: for), and one ROLE pinned to a preset plus an effort of its own. Both surface
+#: as `source: "overlay"` rows next to the profile's own.
+ASSIGNMENT_OVERLAY: dict[str, Any] = {
+    "workers": {"flash_hi": {"preset": "claude_cli_sonnet"}},
+    "roles": {"planner": {"preset": "luna_xhigh", "effort": "high"}},
+    "default_worker": "flash_mid",
+    "candidates": ["flash_lo", "flash_mid", "flash_hi"],
+}
+
+
+def seed_assignments(state_dir: Path) -> Path:
+    """Write `<state_dir>/<project>.assignments.json`, the panel's own layer.
+
+    Through `core.assignments.write_overlay`, not `json.dump`, so the fixture
+    carries whatever envelope (today: `version`) the real writer produces.
+    """
+    path = overlay_path(Path(state_dir), PROJECT)
+    write_overlay(path, ASSIGNMENT_OVERLAY)
+    return path
+
+
+def seed_config_root(root: Path, state_dir: Path) -> Path:
+    """A throwaway config root the API can be served against, deterministically.
+
+    Returns `root`, laid out as `load_config` expects:
+
+      <root>/config/default.yaml            — a copy of the committed defaults
+                                              (presets: and providers: are real)
+      <root>/config/projects/<project>.yaml — the pinned profile above
+
+    `ProjectRegistry(root=<root>)` then allowlists exactly this one project and
+    reads nothing from `projects/` — so the capture cannot pick up a local
+    profile, and cannot see the operator's other projects either.
+    """
+    root, state_dir = Path(root), Path(state_dir)
+    (root / "config" / "projects").mkdir(parents=True, exist_ok=True)
+    shutil.copyfile(REPO_ROOT / "config" / "default.yaml",
+                    root / "config" / "default.yaml")
+    profile = {
+        "project": {"name": PROJECT, "repo_path": None},
+        # Absolute, so the served config finds the seeded store and the overlay
+        # without depending on the process's cwd or on ORCH_PATHS_STATE_DIR.
+        "paths": {"state_dir": str(state_dir),
+                  "work_dir": str(state_dir / "worktrees")},
+        "worker_models": WORKER_MODELS,
+        "roles": ROLES,
+    }
+    (root / "config" / "projects" / f"{PROJECT}.yaml").write_text(
+        yaml.safe_dump(profile, sort_keys=False))
+    return root
+
+
 def main(argv: list[str] | None = None) -> int:
     args = list(sys.argv[1:] if argv is None else argv)
     force = "--force" in args
+    config_root: str | None = None
+    if "--config-root" in args:
+        index = args.index("--config-root")
+        try:
+            config_root = args[index + 1]
+        except IndexError:
+            print("--config-root needs a directory", file=sys.stderr)
+            return 2
+        del args[index:index + 2]
     positional = [a for a in args if a != "--force"]
     if len(positional) != 1:
-        print("usage: python -m tests.api.fixtures.seed_store <state_dir> [--force]",
-              file=sys.stderr)
+        print("usage: python -m tests.api.fixtures.seed_store <state_dir> "
+              "[--force] [--config-root <dir>]", file=sys.stderr)
         return 2
     state_dir = Path(positional[0]).expanduser().resolve()
     # A directory that already holds a store is somebody's real state, and this
@@ -303,6 +418,10 @@ def main(argv: list[str] | None = None) -> int:
     path = state_dir / f"{PROJECT}.sqlite3"
     seed(path)
     print(f"seeded {path}")
+    print(f"seeded {seed_assignments(state_dir)}")
+    if config_root is not None:
+        root = Path(config_root).expanduser().resolve()
+        print(f"seeded {seed_config_root(root, state_dir)}")
     return 0
 
 
