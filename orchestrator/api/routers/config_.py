@@ -11,7 +11,7 @@ list that drifts from the harness the first time a preset is added.
 
 ## The POST is a deliberate, narrow exception to PLAN §3.1 rule 2
 
-The frontend repo's `DEVDOCS/PLAN.md` §3.1 rule 2 says *"GET is read-only,
+The frontend repo's `devdocs/PLAN.md` §3.1 rule 2 says *"GET is read-only,
 literally… Writers stay exclusively the CLI subprocesses"*, and the settings page
 says the panel must not become a second place configuration can be changed. This
 endpoint reverses that, scoped as narrowly as the reversal can be made:

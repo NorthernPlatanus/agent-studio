@@ -1,27 +1,28 @@
-__pycache__/
-*.pyc
-.venv/
-venv/
-.env
-config/local.yaml
-state/
-*.sqlite3
-*.db
-logs/
-.pytest_cache/
-*.egg-info/
-.DS_Store
-.langgraph_api/
-docs/
-# Per-project overlays: real profiles, prompt overrides, project-maps. Root-anchored
-# so it never matches config/projects/ (the committed example.yaml stays tracked).
-/projects/
+.claude/
+.secrets/
+CLAUDE.md
+devdocs/
 *_pat.txt
 *.pat
-.secrets/
-# Reversible removals staged by automated audit/fix runs (never hard-deleted).
-.trash/
 
-# Operator config and policy, not repo content.
-.claude/
-CLAUDE.md
+.env
+.env.*
+!.env.example
+.DS_Store
+
+__pycache__/
+*.pyc
+*.egg-info/
+.pytest_cache/
+.venv/
+venv/
+
+config/local.yaml
+# Root-anchored: config/projects/ holds the tracked example.yaml.
+/projects/
+state/
+logs/
+.trash/
+.langgraph_api/
+*.sqlite3
+*.db

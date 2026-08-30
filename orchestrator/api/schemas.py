@@ -2,7 +2,7 @@
 
 Every field name and type here is a promise to `studio-web` (which generates its
 TypeScript from `/openapi.json`), so a rename is a contract change and belongs in
-`DEVDOCS/DECISIONS.md`.
+`devdocs/DECISIONS.md`.
 
 Two conventions worth knowing before reading further:
 

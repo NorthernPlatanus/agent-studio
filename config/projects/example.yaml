@@ -51,7 +51,7 @@ providers:
 # To run the cheap OpenAI-compatible tier instead, swap the preset for
 # `deepseek_flash` (still shipped); for a subscription CLI, `claude_cli_sonnet`.
 # NOTE: `approach` is static config for now; a future version may let the planner
-# assign it per-task (see the gitignored docs/FUTURE_NOTES.md).
+# assign it per-task (see the gitignored devdocs/FUTURE_NOTES.md).
 worker_models:
   flash_lo:  {preset: luna_high,
               approach: "Simplest correct solution. Minimal diff, no refactoring beyond the task, no cleverness."}
